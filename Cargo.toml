@@ -1,0 +1,33 @@
+[package]
+name = "p25-detector"
+version = "0.1.0"
+edition = "2024"
+description = "Passive P25 Phase 1 mobile-radio proximity detector"
+license = "WTFPL"
+
+[dependencies]
+anyhow = "1.0.102"
+chrono = { version = "0.4.44", features = ["serde"] }
+clap = { version = "4.6.1", features = ["derive"] }
+crossbeam-channel = "0.5.15"
+ctrlc = "3.5.2"
+num-complex = "0.4.6"
+rtlsdr_mt = { version = "2.2.0", optional = true }
+rustfft = "6.4.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[[bin]]
+name = "p25-detector"
+path = "src/main.rs"
+
+[features]
+default = ["rtlsdr"]
+rtlsdr = ["dep:rtlsdr_mt"]

@@ -1,0 +1,8 @@
+/target
+/Cargo.lock
+/op25
+*.iq
+*.bin
+*.log
+.DS_Store
+ROADMAP.md
