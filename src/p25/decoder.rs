@@ -143,8 +143,15 @@ impl Decoder {
         self.dibits.clear();
         self.frames.clear();
 
-        let iq_power_sum: f64 = iq.iter().map(|c| c.norm_sqr() as f64).sum();
-        self.stats.iq_power_sum += iq_power_sum;
+        // Sum |c|² in f32 per-block, then promote to f64 at the block boundary.
+        // The f32→f64 cast inside a `.map().sum()` blocks vectorization; a plain
+        // f32 accumulator over a ≤64K-sample block has ~1e-3 relative error,
+        // which is invisible for statistics-only reporting.
+        let mut block_power = 0.0f32;
+        for &c in iq {
+            block_power += c.re * c.re + c.im * c.im;
+        }
+        self.stats.iq_power_sum += block_power as f64;
         self.stats.iq_count = self.stats.iq_count.saturating_add(iq.len() as u64);
 
         self.decim.process(iq, &mut self.decim_out);
