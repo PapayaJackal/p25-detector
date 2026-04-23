@@ -14,7 +14,12 @@ use crate::sdr::{IqSource, RtlSdr, SAMPLE_RATE};
 use crate::uplink::UplinkWatcher;
 
 const RETUNE_SETTLE_MS: u64 = 60;
-const MEASURE_MS: u64 = 200;
+/// Window over which we integrate uplink power. P25 voice calls start
+/// roughly 250–500 ms after the grant and voice frames are 180 ms apiece, so
+/// a 200 ms window frequently misses the key-up entirely. 600 ms catches the
+/// first 2–3 voice frames in practice; the peak channel also lets us pick
+/// out the actual TX level even when only a fraction of the window is keyed.
+const MEASURE_MS: u64 = 600;
 
 pub struct SingleSdrWatcher {
     sdr: RtlSdr,
@@ -56,7 +61,12 @@ impl SingleSdrWatcher {
         }
     }
 
-    fn measure_uplink_rssi(&mut self, ul_hz: u32) -> Result<f32> {
+    /// Returns `(mean_dbfs, peak_dbfs)`. Peak is the max mean-power over the
+    /// `read_iq`-sized chunks the driver hands back (~25–30 ms each), which
+    /// gives us the actual TX level when a mobile is keyed for only part of
+    /// the window. Mean tracks the full-window average, useful for noise
+    /// floor comparison.
+    fn measure_uplink_rssi(&mut self, ul_hz: u32) -> Result<(f32, f32)> {
         self.sdr.set_center_hz(ul_hz)?;
         let samples_to_settle = (SAMPLE_RATE as u64 * RETUNE_SETTLE_MS / 1000) as usize;
         let mut drained = 0usize;
@@ -71,6 +81,7 @@ impl SingleSdrWatcher {
         let total_needed = (SAMPLE_RATE as u64 * MEASURE_MS / 1000) as usize;
         let mut collected = 0usize;
         let mut total_power_weighted = 0.0f64;
+        let mut peak_power = 0.0f32;
 
         while collected < total_needed {
             let n = self.sdr.read_iq(&mut self.iq_buf)?;
@@ -79,6 +90,9 @@ impl SingleSdrWatcher {
             }
             let power = mean_power(&self.iq_buf[..n]);
             total_power_weighted += (power as f64) * (n as f64);
+            if power > peak_power {
+                peak_power = power;
+            }
             collected += n;
         }
 
@@ -87,7 +101,7 @@ impl SingleSdrWatcher {
         } else {
             0.0
         };
-        Ok(to_dbfs(avg))
+        Ok((to_dbfs(avg), to_dbfs(peak_power)))
     }
 }
 
@@ -102,7 +116,7 @@ impl UplinkWatcher for SingleSdrWatcher {
         }
 
         info!(tgid = grant.tgid, rid = grant.rid, ul_hz = grant.ul_hz, "measuring uplink RSSI");
-        let rssi = match self.measure_uplink_rssi(grant.ul_hz as u32) {
+        let (rssi_mean, rssi_peak) = match self.measure_uplink_rssi(grant.ul_hz as u32) {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, "uplink measurement failed");
@@ -117,6 +131,14 @@ impl UplinkWatcher for SingleSdrWatcher {
             warn!(error = %e, "failed to retune back to CC");
         }
 
+        info!(
+            tgid = grant.tgid,
+            rid = grant.rid,
+            rssi_mean_dbfs = rssi_mean,
+            rssi_peak_dbfs = rssi_peak,
+            "uplink RSSI measured",
+        );
+
         self.last_measurement.insert(grant.tgid, Instant::now());
         self.logger.log(&Measurement {
             ts: Utc::now(),
@@ -124,7 +146,8 @@ impl UplinkWatcher for SingleSdrWatcher {
             rid: grant.rid,
             dl_hz: grant.dl_hz as u32,
             ul_hz: grant.ul_hz as u32,
-            rssi_dbfs: rssi,
+            rssi_dbfs: rssi_mean,
+            rssi_peak_dbfs: Some(rssi_peak),
             mode: self.mode,
         });
     }

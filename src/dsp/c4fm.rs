@@ -26,6 +26,30 @@ impl FmDiscriminator {
     }
 }
 
+/// Single-pole IIR DC blocker: y[n] = x[n] - x[n-1] + α·y[n-1].
+/// With α = 0.9995 at 48 kHz the -3 dB corner is ≈ 4 Hz, well below any
+/// real modulation content but well above static LO offset.
+pub struct DcBlock {
+    alpha: f32,
+    last_in: f32,
+    last_out: f32,
+}
+
+impl DcBlock {
+    pub fn new(alpha: f32) -> Self {
+        Self { alpha, last_in: 0.0, last_out: 0.0 }
+    }
+
+    pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        for &x in input {
+            let y = x - self.last_in + self.alpha * self.last_out;
+            out.push(y);
+            self.last_in = x;
+            self.last_out = y;
+        }
+    }
+}
+
 /// Real matched-filter for C4FM. `coeffs` is a raised-cosine-shaped low-pass
 /// designed for the target samples-per-symbol.
 pub struct MatchedFilter {

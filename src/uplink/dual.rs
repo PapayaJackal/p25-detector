@@ -34,10 +34,11 @@ impl DualSdrWatcher {
         center_hz: u32,
         sample_rate: u32,
         gain: Option<i32>,
+        ppm: i32,
         logger: JsonlLogger,
         mode: Mode,
     ) -> Result<Self> {
-        let sdr = RtlSdr::open(device_index, center_hz, sample_rate, gain)
+        let sdr = RtlSdr::open(device_index, center_hz, sample_rate, gain, ppm)
             .context("opening RTL-SDR for uplink watcher")?;
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(FFT_SIZE);
@@ -113,6 +114,7 @@ impl UplinkWatcher for DualSdrWatcher {
             dl_hz: grant.dl_hz as u32,
             ul_hz,
             rssi_dbfs: rssi,
+            rssi_peak_dbfs: None,
             mode: self.mode,
         });
     }

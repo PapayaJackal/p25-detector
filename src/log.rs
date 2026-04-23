@@ -16,7 +16,17 @@ pub struct Measurement {
     pub rid: u32,
     pub dl_hz: u32,
     pub ul_hz: u32,
+    /// Mean power over the measurement window, dBFS. Matches noise floor on
+    /// idle channels; actual TX pulls it up only for the fraction of the
+    /// window the mobile was keyed.
     pub rssi_dbfs: f32,
+    /// Peak chunk power during the measurement window, dBFS. A chunk is
+    /// whatever the SDR driver hands back per `read_iq` — on the order of
+    /// 25–30 ms. Best estimate of the actual mobile TX strength when the
+    /// key-up happens inside our measurement window. Only populated by
+    /// single-SDR mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rssi_peak_dbfs: Option<f32>,
     pub mode: Mode,
 }
 

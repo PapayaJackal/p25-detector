@@ -49,7 +49,13 @@ mod backend {
     }
 
     impl RtlSdr {
-        pub fn open(index: u32, center_hz: u32, rate_hz: u32, gain: Option<i32>) -> Result<Self> {
+        pub fn open(
+            index: u32,
+            center_hz: u32,
+            rate_hz: u32,
+            gain: Option<i32>,
+            ppm: i32,
+        ) -> Result<Self> {
             // rtlsdr_mt's Error type is `()` — there is no underlying message to
             // preserve, so `.ok().context(...)` is the most informative we can be.
             let (ctl, reader) = rtlsdr_mt::open(index)
@@ -57,6 +63,15 @@ mod backend {
                 .with_context(|| format!("rtlsdr_mt::open({index}) failed"))?;
             let mut ctl = ctl;
             ctl.set_sample_rate(rate_hz).ok().context("set_sample_rate failed")?;
+            ctl.set_ppm(ppm).ok().context("set_ppm failed")?;
+            // R820T PLL-relock workaround: on some dongles the first tune after
+            // power-up prints "[R82XX] PLL not locked!" and leaves the LO in a bad
+            // state. Calling set_center_freq twice in a row to the target lets the
+            // tuner reprogram the VCO from an already-initialized state on the
+            // second call, which usually locks. librtlsdr doesn't surface PLL
+            // status to callers (it only prints to stderr and returns OK), so we
+            // just do the dance unconditionally.
+            ctl.set_center_freq(center_hz).ok().context("set_center_freq failed")?;
             ctl.set_center_freq(center_hz).ok().context("set_center_freq failed")?;
             match gain {
                 Some(tenths) => {
@@ -161,6 +176,7 @@ mod stub {
             _center_hz: u32,
             _rate_hz: u32,
             _gain: Option<i32>,
+            _ppm: i32,
         ) -> Result<Self> {
             Ok(Self)
         }

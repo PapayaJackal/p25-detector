@@ -45,6 +45,11 @@ pub struct Cli {
     #[arg(long)]
     pub gain: Option<i32>,
 
+    /// Tuner frequency correction in ppm (e.g. -4 if kalibrate reports
+    /// -3.6 ppm). Defaults to 0.
+    #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
+    pub ppm: i32,
+
     /// Minimum time between RSSI measurements for the same TGID (single-sdr mode)
     #[arg(long, default_value_t = 5000)]
     pub min_measure_interval_ms: u64,
@@ -62,6 +67,7 @@ pub struct RuntimeConfig {
     pub uplink_device: Option<u32>,
     pub uplink_center_hz: Option<u32>,
     pub gain: Option<i32>,
+    pub ppm: i32,
     pub watched_tgids: Vec<u16>,
     pub min_measure_interval_ms: u64,
     pub log_path: Option<PathBuf>,
@@ -93,6 +99,7 @@ impl Cli {
             uplink_device: self.uplink_device,
             uplink_center_hz,
             gain: self.gain,
+            ppm: self.ppm,
             watched_tgids: self.watch_tgid,
             min_measure_interval_ms: self.min_measure_interval_ms,
             log_path,
