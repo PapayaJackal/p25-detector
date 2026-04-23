@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use num_complex::Complex32;
 
+mod audio;
 mod config;
 mod dsp;
 mod log;
@@ -12,6 +13,7 @@ mod p25;
 mod sdr;
 mod uplink;
 
+use audio::Beeper;
 use config::{Cli, Mode, RuntimeConfig};
 use p25::Decoder;
 use sdr::{IqSource, RtlSdr, SAMPLE_RATE};
@@ -47,8 +49,22 @@ fn main() -> Result<()> {
     }
 }
 
+fn make_beeper(enabled: bool) -> Option<Beeper> {
+    if !enabled {
+        return None;
+    }
+    match Beeper::try_new() {
+        Ok(b) => Some(b),
+        Err(e) => {
+            tracing::warn!(error = %e, "audio output unavailable; continuing silently");
+            None
+        }
+    }
+}
+
 fn run_single(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> Result<()> {
     let logger = log::JsonlLogger::open(cfg.log_path.as_deref())?;
+    let beeper = make_beeper(cfg.beep);
     let sdr = RtlSdr::open(cfg.cc_device, cfg.cc_freq_hz, SAMPLE_RATE, cfg.gain, cfg.ppm)
         .context("opening RTL-SDR on CC")?;
 
@@ -59,6 +75,7 @@ fn run_single(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> Result<()> {
         cfg.min_measure_interval_ms,
         logger,
         cfg.mode,
+        beeper,
     );
 
     let mut buf = vec![Complex32::new(0.0, 0.0); 1 << 16];
@@ -73,21 +90,24 @@ fn run_single(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> Result<()> {
 
 fn run_dual(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> Result<()> {
     let logger = log::JsonlLogger::open(cfg.log_path.as_deref())?;
+    let beeper = make_beeper(cfg.beep);
     let uplink_center = cfg
         .uplink_center_hz
         .context("dual-sdr mode requires --uplink-center")?;
     let uplink_device = cfg.uplink_device.unwrap_or(1);
 
     let mut cc = RtlSdr::open(cfg.cc_device, cfg.cc_freq_hz, SAMPLE_RATE, cfg.gain, cfg.ppm)?;
+    let uplink_sdr =
+        RtlSdr::open(uplink_device, uplink_center, SAMPLE_RATE, cfg.gain, cfg.ppm)
+            .context("opening RTL-SDR for uplink watcher")?;
     let mut decoder = Decoder::new(SAMPLE_RATE, cfg.watched_tgids.clone());
-    let mut watcher = DualSdrWatcher::open(
-        uplink_device,
+    let mut watcher = DualSdrWatcher::new(
+        uplink_sdr,
         uplink_center,
         SAMPLE_RATE,
-        cfg.gain,
-        cfg.ppm,
         logger,
         cfg.mode,
+        beeper,
     )?;
 
     let mut buf = vec![Complex32::new(0.0, 0.0); 1 << 16];

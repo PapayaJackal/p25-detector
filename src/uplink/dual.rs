@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 use tracing::warn;
 
+use crate::audio::Beeper;
 use crate::config::Mode;
 use crate::dsp::power::to_dbfs;
 use crate::log::{JsonlLogger, Measurement};
@@ -26,20 +27,18 @@ pub struct DualSdrWatcher {
     fft_scratch: Vec<Complex32>,
     bin_power: Vec<f32>,
     avg_alpha: f32,
+    beeper: Option<Beeper>,
 }
 
 impl DualSdrWatcher {
-    pub fn open(
-        device_index: u32,
+    pub fn new(
+        sdr: RtlSdr,
         center_hz: u32,
         sample_rate: u32,
-        gain: Option<i32>,
-        ppm: i32,
         logger: JsonlLogger,
         mode: Mode,
+        beeper: Option<Beeper>,
     ) -> Result<Self> {
-        let sdr = RtlSdr::open(device_index, center_hz, sample_rate, gain, ppm)
-            .context("opening RTL-SDR for uplink watcher")?;
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(FFT_SIZE);
         Ok(Self {
@@ -53,6 +52,7 @@ impl DualSdrWatcher {
             fft_scratch: vec![Complex32::new(0.0, 0.0); FFT_SIZE],
             bin_power: vec![0.0f32; FFT_SIZE],
             avg_alpha: 0.1,
+            beeper,
         })
     }
 
@@ -117,5 +117,8 @@ impl UplinkWatcher for DualSdrWatcher {
             rssi_peak_dbfs: None,
             mode: self.mode,
         });
+        if let Some(b) = &self.beeper {
+            b.beep(grant.tgid, grant.rid, rssi);
+        }
     }
 }

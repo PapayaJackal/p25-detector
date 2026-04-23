@@ -6,6 +6,7 @@ use chrono::Utc;
 use num_complex::Complex32;
 use tracing::{info, warn};
 
+use crate::audio::Beeper;
 use crate::config::Mode;
 use crate::dsp::power::{mean_power, to_dbfs};
 use crate::log::{JsonlLogger, Measurement};
@@ -29,6 +30,7 @@ pub struct SingleSdrWatcher {
     logger: JsonlLogger,
     mode: Mode,
     iq_buf: Vec<Complex32>,
+    beeper: Option<Beeper>,
 }
 
 impl SingleSdrWatcher {
@@ -38,6 +40,7 @@ impl SingleSdrWatcher {
         min_measure_interval_ms: u64,
         logger: JsonlLogger,
         mode: Mode,
+        beeper: Option<Beeper>,
     ) -> Self {
         Self {
             sdr,
@@ -47,6 +50,7 @@ impl SingleSdrWatcher {
             logger,
             mode,
             iq_buf: vec![Complex32::new(0.0, 0.0); 1 << 16],
+            beeper,
         }
     }
 
@@ -150,5 +154,9 @@ impl UplinkWatcher for SingleSdrWatcher {
             rssi_peak_dbfs: Some(rssi_peak),
             mode: self.mode,
         });
+        if let Some(b) = &self.beeper {
+            // Peak, not mean: mobiles are often keyed for only part of the window.
+            b.beep(grant.tgid, grant.rid, rssi_peak);
+        }
     }
 }

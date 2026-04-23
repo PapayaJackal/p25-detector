@@ -57,6 +57,10 @@ pub struct Cli {
     /// Output log path. `-` or omitted means stdout.
     #[arg(long)]
     pub log: Option<PathBuf>,
+
+    /// Silence the audio beep that normally plays on each measurement.
+    #[arg(long, default_value_t = false)]
+    pub no_beep: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +75,7 @@ pub struct RuntimeConfig {
     pub watched_tgids: Vec<u16>,
     pub min_measure_interval_ms: u64,
     pub log_path: Option<PathBuf>,
+    pub beep: bool,
 }
 
 impl Cli {
@@ -103,6 +108,7 @@ impl Cli {
             watched_tgids: self.watch_tgid,
             min_measure_interval_ms: self.min_measure_interval_ms,
             log_path,
+            beep: !self.no_beep,
         })
     }
 }
