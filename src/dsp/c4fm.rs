@@ -52,32 +52,43 @@ impl DcBlock {
 
 /// Real matched-filter for C4FM. `coeffs` is a raised-cosine-shaped low-pass
 /// designed for the target samples-per-symbol.
+///
+/// See [`super::fir::FirDecimator`] for the doubled-history / reversed-taps
+/// layout that keeps the inner loop a flat slice zip.
 pub struct MatchedFilter {
-    taps: Vec<f32>,
+    taps_rev: Vec<f32>,
     history: Vec<f32>,
     write: usize,
+    n_taps: usize,
 }
 
 impl MatchedFilter {
     pub fn new(taps: Vec<f32>) -> Self {
-        let n = taps.len();
+        let n_taps = taps.len().max(1);
+        let mut taps_rev = taps;
+        taps_rev.reverse();
         Self {
-            taps,
-            history: vec![0.0; n.next_power_of_two().max(2)],
+            taps_rev,
+            history: vec![0.0; 2 * n_taps],
             write: 0,
+            n_taps,
         }
     }
 
     pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
-        let mask = self.history.len() - 1;
+        let n = self.n_taps;
+        out.reserve(input.len());
         for &x in input {
             self.history[self.write] = x;
-            self.write = (self.write + 1) & mask;
+            self.history[self.write + n] = x;
+            self.write += 1;
+            if self.write == n {
+                self.write = 0;
+            }
+            let window = &self.history[self.write..self.write + n];
             let mut acc = 0.0f32;
-            let mut idx = (self.write + self.history.len() - 1) & mask;
-            for &t in &self.taps {
-                acc += self.history[idx] * t;
-                idx = (idx + self.history.len() - 1) & mask;
+            for (&t, &s) in self.taps_rev.iter().zip(window.iter()) {
+                acc += t * s;
             }
             out.push(acc);
         }

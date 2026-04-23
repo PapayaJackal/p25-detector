@@ -2,42 +2,58 @@ use num_complex::Complex32;
 use std::f32::consts::PI;
 
 /// Polyphase-free FIR with integer decimation. Keeps a delay line internally.
+///
+/// History is a doubled ring buffer: each incoming sample is written at both
+/// `write` and `write + n_taps`, so the convolution window is always the
+/// contiguous slice `history[write..write+n_taps]`. That eliminates modular
+/// index arithmetic from the inner loop and lets LLVM vectorize the
+/// multiply-accumulate over the taps. Taps are stored reversed so that
+/// `taps_rev[i]` lines up with `window[i]` under a plain forward zip.
 pub struct FirDecimator {
-    taps: Vec<f32>,
+    taps_rev: Vec<f32>,
     history: Vec<Complex32>,
     write: usize,
+    n_taps: usize,
     decim: usize,
     phase: usize,
 }
 
 impl FirDecimator {
     pub fn new(taps: Vec<f32>, decim: usize) -> Self {
-        let n = taps.len();
+        let n_taps = taps.len().max(1);
+        let mut taps_rev = taps;
+        taps_rev.reverse();
         Self {
-            taps,
-            history: vec![Complex32::new(0.0, 0.0); n.next_power_of_two().max(2)],
+            taps_rev,
+            history: vec![Complex32::new(0.0, 0.0); 2 * n_taps],
             write: 0,
+            n_taps,
             decim: decim.max(1),
             phase: 0,
         }
     }
 
     pub fn process(&mut self, input: &[Complex32], out: &mut Vec<Complex32>) {
-        let mask = self.history.len() - 1;
-        let n_taps = self.taps.len();
+        let n = self.n_taps;
+        out.reserve(input.len() / self.decim + 1);
         for &x in input {
             self.history[self.write] = x;
-            self.write = (self.write + 1) & mask;
+            self.history[self.write + n] = x;
+            self.write += 1;
+            if self.write == n {
+                self.write = 0;
+            }
             self.phase += 1;
             if self.phase >= self.decim {
                 self.phase = 0;
-                let mut acc = Complex32::new(0.0, 0.0);
-                let mut idx = (self.write + self.history.len() - 1) & mask;
-                for &tap in self.taps.iter().take(n_taps) {
-                    acc += self.history[idx] * tap;
-                    idx = (idx + self.history.len() - 1) & mask;
+                let window = &self.history[self.write..self.write + n];
+                let mut re = 0.0f32;
+                let mut im = 0.0f32;
+                for (&t, s) in self.taps_rev.iter().zip(window.iter()) {
+                    re += t * s.re;
+                    im += t * s.im;
                 }
-                out.push(acc);
+                out.push(Complex32::new(re, im));
             }
         }
     }
