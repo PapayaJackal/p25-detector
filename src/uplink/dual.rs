@@ -118,7 +118,7 @@ impl UplinkWatcher for DualSdrWatcher {
             mode: self.mode,
         });
         if let Some(b) = &self.beeper {
-            b.beep(grant.tgid, grant.rid, rssi);
+            b.beep(rssi);
         }
     }
 }

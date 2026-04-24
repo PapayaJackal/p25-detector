@@ -156,7 +156,7 @@ impl UplinkWatcher for SingleSdrWatcher {
         });
         if let Some(b) = &self.beeper {
             // Peak, not mean: mobiles are often keyed for only part of the window.
-            b.beep(grant.tgid, grant.rid, rssi_peak);
+            b.beep(rssi_peak);
         }
     }
 }

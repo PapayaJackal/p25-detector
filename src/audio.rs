@@ -1,10 +1,10 @@
 //! Audio feedback: short tone on every logged grant.
 //!
-//! Pitch is a hash of `(tgid, rid)` mapped onto an A-minor pentatonic scale
-//! covering A4–A6. That range stays inside the ear's roughly-flat
-//! equal-loudness region (~400 Hz – 2 kHz), so perceived volume is dominated
-//! by RSSI — not by which (tgid, rid) happened to draw a low tone. Volume
-//! itself is linear in dBFS (so perceived loudness tracks RSSI) and clamped.
+//! Pitch tracks RSSI: louder signal (closer mobile) → higher note. RSSI is
+//! mapped linearly onto an A-minor pentatonic scale spanning A3–A7 (four
+//! octaves, 20 slots) for good proximity resolution. Amplitude also scales
+//! with RSSI, so distant/likely-out-of-range signals are quiet and reinforce
+//! the low pitch, while close signals are loud and high.
 //!
 //! Single voice: a new beep replaces an in-flight one.
 
@@ -15,18 +15,18 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use tracing::warn;
 
-const BEEP_MS: u32 = 220;
-const ATTACK_MS: u32 = 5;
-const RELEASE_MS: u32 = 40;
+const BEEP_MS: u32 = 260;
+const ATTACK_MS: u32 = 25;
+const RELEASE_MS: u32 = 120;
 
 const RSSI_QUIET_DBFS: f32 = -70.0;
 const RSSI_LOUD_DBFS: f32 = -20.0;
-const AMP_MIN: f32 = 0.02;
-const AMP_MAX: f32 = 0.55;
+const AMP_MIN: f32 = 0.04;
+const AMP_MAX: f32 = 0.22;
 
 const PENTATONIC_SEMITONES: [i32; 5] = [0, 3, 5, 7, 10];
-const OCTAVES: i32 = 2;
-const BASE_HZ: f32 = 440.0;
+const OCTAVES: i32 = 4;
+const BASE_HZ: f32 = 220.0;
 
 #[derive(Copy, Clone)]
 struct BeepCmd {
@@ -73,11 +73,12 @@ impl Beeper {
         })
     }
 
-    pub fn beep(&self, tgid: u16, rid: u32, rssi_dbfs: f32) {
+    pub fn beep(&self, rssi_dbfs: f32) {
+        let t = rssi_t(rssi_dbfs);
         let total = (self.sample_rate * BEEP_MS) / 1000;
         let cmd = BeepCmd {
-            freq_hz: tone_for(tgid, rid),
-            amp: amp_for(rssi_dbfs),
+            freq_hz: tone_for(t),
+            amp: AMP_MIN + t * (AMP_MAX - AMP_MIN),
             total_samples: total,
             attack_samples: (self.sample_rate * ATTACK_MS) / 1000,
             release_samples: (self.sample_rate * RELEASE_MS) / 1000,
@@ -144,13 +145,15 @@ impl Oscillator {
             return 0.0;
         }
         let remaining = self.total_samples - self.elapsed;
-        let env = if self.elapsed < self.attack_samples {
+        // Raised cosine: no corners at attack/release boundaries, so no soft click.
+        let ramp = if self.elapsed < self.attack_samples {
             self.elapsed as f32 / self.attack_samples as f32
         } else if remaining < self.release_samples {
             remaining as f32 / self.release_samples as f32
         } else {
             1.0
         };
+        let env = 0.5 - 0.5 * (ramp * std::f32::consts::PI).cos();
         let s = (self.phase * TAU).sin() * self.amp * env;
         self.phase += self.freq_hz / sr;
         if self.phase >= 1.0 {
@@ -161,24 +164,20 @@ impl Oscillator {
     }
 }
 
-fn tone_for(tgid: u16, rid: u32) -> f32 {
-    let slots = (PENTATONIC_SEMITONES.len() as u32) * (OCTAVES as u32);
-    let mix = (tgid as u32)
-        .wrapping_mul(2_246_822_519)
-        .wrapping_add(rid.wrapping_mul(3_266_489_917));
-    let slot = mix % slots;
-    let octave = (slot / PENTATONIC_SEMITONES.len() as u32) as i32;
-    let step = PENTATONIC_SEMITONES[(slot % PENTATONIC_SEMITONES.len() as u32) as usize];
-    let semitones = octave * 12 + step;
-    BASE_HZ * 2_f32.powf(semitones as f32 / 12.0)
+fn rssi_t(rssi_dbfs: f32) -> f32 {
+    if !rssi_dbfs.is_finite() {
+        return 0.0;
+    }
+    ((rssi_dbfs - RSSI_QUIET_DBFS) / (RSSI_LOUD_DBFS - RSSI_QUIET_DBFS)).clamp(0.0, 1.0)
 }
 
-fn amp_for(rssi_dbfs: f32) -> f32 {
-    if !rssi_dbfs.is_finite() {
-        return AMP_MIN;
-    }
-    let t = ((rssi_dbfs - RSSI_QUIET_DBFS) / (RSSI_LOUD_DBFS - RSSI_QUIET_DBFS)).clamp(0.0, 1.0);
-    AMP_MIN + t * (AMP_MAX - AMP_MIN)
+fn tone_for(t: f32) -> f32 {
+    let slots = (PENTATONIC_SEMITONES.len() as i32) * OCTAVES;
+    let slot = ((t * slots as f32) as i32).min(slots - 1);
+    let octave = slot / PENTATONIC_SEMITONES.len() as i32;
+    let step = PENTATONIC_SEMITONES[(slot % PENTATONIC_SEMITONES.len() as i32) as usize];
+    let semitones = octave * 12 + step;
+    BASE_HZ * 2_f32.powf(semitones as f32 / 12.0)
 }
 
 #[cfg(test)]
@@ -186,31 +185,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tones_stay_in_flat_loudness_region() {
-        for tgid in [1u16, 42, 1234, 65535] {
-            for rid in [1u32, 99, 1_000_000, u32::MAX] {
-                let f = tone_for(tgid, rid);
-                assert!(
-                    (BASE_HZ..=BASE_HZ * 4.0).contains(&f),
-                    "tone {f} out of range"
-                );
-            }
+    fn tones_stay_within_scale_range() {
+        let top = BASE_HZ * 2_f32.powi(OCTAVES);
+        for rssi in [-200.0, -70.0, -45.0, -20.0, 0.0, f32::NAN] {
+            let f = tone_for(rssi_t(rssi));
+            assert!((BASE_HZ..=top).contains(&f), "tone {f} out of range");
         }
     }
 
     #[test]
-    fn different_ids_generally_give_different_tones() {
-        let a = tone_for(100, 500);
-        let b = tone_for(101, 500);
-        let c = tone_for(100, 501);
-        assert!(a != b || a != c, "hash is degenerate");
+    fn louder_rssi_gives_higher_pitch() {
+        assert!(tone_for(rssi_t(-20.0)) > tone_for(rssi_t(-45.0)));
+        assert!(tone_for(rssi_t(-45.0)) > tone_for(rssi_t(-70.0)));
     }
 
     #[test]
-    fn amp_clamps_and_tracks_rssi() {
-        assert!((amp_for(-200.0) - AMP_MIN).abs() < 1e-6);
-        assert!((amp_for(0.0) - AMP_MAX).abs() < 1e-6);
-        assert!(amp_for(-45.0) > amp_for(-60.0));
-        assert!(amp_for(-20.0) > amp_for(-45.0));
+    fn tone_clamps_at_rails() {
+        assert!((tone_for(rssi_t(-200.0)) - BASE_HZ).abs() < 1e-3);
+        assert!(tone_for(rssi_t(0.0)) > BASE_HZ * 2_f32.powi(OCTAVES - 1));
+    }
+
+    #[test]
+    fn weak_rssi_is_quiet_strong_is_loud() {
+        assert!(rssi_t(-70.0) < 0.01);
+        assert!(rssi_t(-20.0) > 0.99);
+        let quiet = AMP_MIN + rssi_t(-60.0) * (AMP_MAX - AMP_MIN);
+        let loud = AMP_MIN + rssi_t(-25.0) * (AMP_MAX - AMP_MIN);
+        assert!(loud > quiet * 2.0);
     }
 }
