@@ -49,11 +49,11 @@ fn main() -> Result<()> {
     }
 }
 
-fn make_beeper(enabled: bool) -> Option<Beeper> {
+fn make_beeper(enabled: bool, rssi_min_dbfs: f32) -> Option<Beeper> {
     if !enabled {
         return None;
     }
-    match Beeper::try_new() {
+    match Beeper::try_new(rssi_min_dbfs) {
         Ok(b) => Some(b),
         Err(e) => {
             tracing::warn!(error = %e, "audio output unavailable; continuing silently");
@@ -64,7 +64,7 @@ fn make_beeper(enabled: bool) -> Option<Beeper> {
 
 fn run_single(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> Result<()> {
     let logger = log::JsonlLogger::open(cfg.log_path.as_deref())?;
-    let beeper = make_beeper(cfg.beep);
+    let beeper = make_beeper(cfg.beep, cfg.beep_rssi_min_dbfs);
     let sdr = RtlSdr::open(cfg.cc_device, cfg.cc_freq_hz, SAMPLE_RATE, cfg.gain, cfg.ppm)
         .context("opening RTL-SDR on CC")?;
 
@@ -90,7 +90,7 @@ fn run_single(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> Result<()> {
 
 fn run_dual(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> Result<()> {
     let logger = log::JsonlLogger::open(cfg.log_path.as_deref())?;
-    let beeper = make_beeper(cfg.beep);
+    let beeper = make_beeper(cfg.beep, cfg.beep_rssi_min_dbfs);
     let uplink_center = cfg
         .uplink_center_hz
         .context("dual-sdr mode requires --uplink-center")?;

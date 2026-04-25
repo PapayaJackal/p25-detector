@@ -61,6 +61,11 @@ pub struct Cli {
     /// Silence the audio beep that normally plays on each measurement.
     #[arg(long, default_value_t = false)]
     pub no_beep: bool,
+
+    /// Suppress the beep when RSSI (dBFS) is below this value. Negative
+    /// numbers expected (e.g. `-60`). Default: no threshold.
+    #[arg(long, allow_hyphen_values = true)]
+    pub beep_rssi_min: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +81,7 @@ pub struct RuntimeConfig {
     pub min_measure_interval_ms: u64,
     pub log_path: Option<PathBuf>,
     pub beep: bool,
+    pub beep_rssi_min_dbfs: f32,
 }
 
 impl Cli {
@@ -109,6 +115,7 @@ impl Cli {
             min_measure_interval_ms: self.min_measure_interval_ms,
             log_path,
             beep: !self.no_beep,
+            beep_rssi_min_dbfs: self.beep_rssi_min.unwrap_or(f32::NEG_INFINITY),
         })
     }
 }

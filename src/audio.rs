@@ -40,11 +40,12 @@ struct BeepCmd {
 pub struct Beeper {
     tx: Sender<BeepCmd>,
     sample_rate: u32,
+    rssi_min_dbfs: f32,
     _stream: cpal::Stream,
 }
 
 impl Beeper {
-    pub fn try_new() -> Result<Self> {
+    pub fn try_new(rssi_min_dbfs: f32) -> Result<Self> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -69,11 +70,15 @@ impl Beeper {
         Ok(Self {
             tx,
             sample_rate,
+            rssi_min_dbfs,
             _stream: stream,
         })
     }
 
     pub fn beep(&self, rssi_dbfs: f32) {
+        if !rssi_dbfs.is_finite() || rssi_dbfs < self.rssi_min_dbfs {
+            return;
+        }
         let t = rssi_t(rssi_dbfs);
         let total = (self.sample_rate * BEEP_MS) / 1000;
         let cmd = BeepCmd {
