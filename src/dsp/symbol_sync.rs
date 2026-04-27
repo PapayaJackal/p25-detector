@@ -65,6 +65,24 @@ impl GardnerSync {
         }
     }
 
+    /// Restore the loop to its post-`new` state without dropping `sps` or
+    /// the gain configuration. Stats counters are zeroed too so the next
+    /// heartbeat reports only post-reset behaviour.
+    pub fn reset(&mut self) {
+        self.mu = 0.5;
+        self.freq = 0.0;
+        self.hist = [0.0; 4];
+        self.last_sym = 0.0;
+        self.mid_sym = 0.0;
+        self.counter = 0.0;
+        self.toggle = false;
+        self.wraps = 0;
+        self.lock_q = 0.0;
+        self.err_sum = 0.0;
+        self.err_count = 0;
+        self.sat_count = 0;
+    }
+
     pub fn mu(&self) -> f32 {
         self.mu
     }

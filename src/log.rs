@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::config::Mode;
+use crate::p25::GrantKind;
 
 #[derive(Debug, Serialize)]
 pub struct Measurement {
@@ -16,6 +17,10 @@ pub struct Measurement {
     pub rid: u32,
     pub dl_hz: u32,
     pub ul_hz: u32,
+    /// Which TSBK opcode produced the grant — distinguishes a fresh
+    /// allocation from a mid-call update, where keying is already in
+    /// progress on retune.
+    pub kind: GrantKind,
     /// In-channel power (S+N) in dBFS. For single-SDR mode this is the mean
     /// over chunks where keyup was detected; for dual-SDR mode it is a
     /// snapshot from the EMA-smoothed bin powers at grant time.
@@ -28,6 +33,22 @@ pub struct Measurement {
     /// window. Stable across gain settings, unlike the raw dBFS fields.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snr_db: Option<f32>,
+    /// Single-SDR-only diagnostic: how many of the FFT chunks in the window
+    /// crossed the VAD threshold. A real keyup looks like a high
+    /// `keyed_count / chunk_count` ratio; a noise-tail VAD trigger sits
+    /// just at the [`MIN_KEYED_CHUNKS`](crate::uplink::single) gate value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keyed_count: Option<u64>,
+    /// Single-SDR-only diagnostic: total FFT chunks measured in the window.
+    /// Smaller than the [`MEASURE_MS`](crate::uplink::single) chunk budget
+    /// when early-exit fired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_count: Option<u64>,
+    /// Single-SDR-only diagnostic: maximum single-chunk in-channel/noise
+    /// ratio observed. A real keyup hits the tens-to-hundreds; a noise-tail
+    /// trigger barely clears the VAD threshold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_ratio: Option<f32>,
     pub mode: Mode,
 }
 

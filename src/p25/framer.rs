@@ -70,6 +70,19 @@ impl Framer {
         }
     }
 
+    /// Drop any in-progress hunt/NID/body state. Call after a retune so a
+    /// half-collected frame from the previous tune doesn't get stitched
+    /// together with fresh dibits.
+    pub fn reset(&mut self) {
+        self.sync_sr = 0;
+        self.nid_syms = 0;
+        self.nid_accum = 0;
+        self.state = State::Hunt;
+        self.body.clear();
+        self.body_target_dibits = 0;
+        self.current_duid = None;
+    }
+
     /// Feed one dibit. Returns `Some(Frame)` when a complete frame is ready.
     pub fn push_dibit(&mut self, dibit: u8) -> Option<Frame> {
         let dibit = dibit & 0x3;

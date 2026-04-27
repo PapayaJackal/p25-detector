@@ -49,6 +49,18 @@ impl FskSlicer {
         }
     }
 
+    /// Wipe the running-mean and rail EMAs back to cold-start zeros. Required
+    /// after a retune because amp_outer only updates when a sample crosses
+    /// `0.5*(amp_inner+amp_outer)` — once the input rails shrink it can
+    /// otherwise stay frozen at the prior level forever, leaving the slicer
+    /// unable to see ±3 symbols.
+    pub fn reset(&mut self) {
+        self.mean = 0.0;
+        self.amp_inner = 0.0;
+        self.amp_outer = 0.0;
+        self.dibit_hist = [0; 4];
+    }
+
     pub fn slice_one(&mut self, y: f32) -> u8 {
         self.mean = (1.0 - self.alpha) * self.mean + self.alpha * y;
         let centered = y - self.mean;

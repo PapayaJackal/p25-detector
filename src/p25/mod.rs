@@ -9,4 +9,4 @@ pub mod tsbk;
 mod decoder;
 
 pub use decoder::Decoder;
-pub use tsbk::Grant;
+pub use tsbk::{Grant, GrantKind};

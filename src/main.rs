@@ -81,8 +81,12 @@ fn run_single(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> Result<()> {
     let mut buf = vec![Complex32::new(0.0, 0.0); 1 << 16];
     while !stop.load(Ordering::SeqCst) {
         let n = watcher.read_cc(&mut buf)?;
+        let mut retuned = false;
         for grant in decoder.process(&buf[..n]) {
-            watcher.on_grant(grant);
+            retuned |= watcher.on_grant(grant);
+        }
+        if retuned {
+            decoder.reset();
         }
     }
     Ok(())
@@ -114,7 +118,7 @@ fn run_dual(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> Result<()> {
     while !stop.load(Ordering::SeqCst) {
         let n = cc.read_iq(&mut buf)?;
         for grant in decoder.process(&buf[..n]) {
-            watcher.on_grant(grant);
+            let _ = watcher.on_grant(grant);
         }
         watcher.pump()?;
     }

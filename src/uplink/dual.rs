@@ -97,10 +97,10 @@ impl DualSdrWatcher {
 }
 
 impl UplinkWatcher for DualSdrWatcher {
-    fn on_grant(&mut self, grant: Grant) {
+    fn on_grant(&mut self, grant: Grant) -> bool {
         if grant.ul_hz == 0 || grant.ul_hz > u32::MAX as u64 {
             warn!(tgid = grant.tgid, "uplink frequency out of range for dual-sdr watcher");
-            return;
+            return false;
         }
         let ul_hz = grant.ul_hz as u32;
         let bin = match self.bin_for_freq(ul_hz) {
@@ -111,7 +111,7 @@ impl UplinkWatcher for DualSdrWatcher {
                     center = self.center_hz,
                     "uplink frequency falls outside wideband capture"
                 );
-                return;
+                return false;
             }
         };
 
@@ -130,13 +130,18 @@ impl UplinkWatcher for DualSdrWatcher {
             rid: grant.rid,
             dl_hz: grant.dl_hz as u32,
             ul_hz,
+            kind: grant.kind,
             channel_dbfs: to_dbfs(m.signal),
             noise_dbfs: to_dbfs(m.noise),
             snr_db,
+            keyed_count: None,
+            chunk_count: None,
+            peak_ratio: None,
             mode: self.mode,
         });
         if let (Some(b), Some(snr)) = (&self.beeper, snr_db) {
             b.beep(snr);
         }
+        false
     }
 }

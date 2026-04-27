@@ -11,7 +11,7 @@ use crate::p25::framer::{Framer, Frame};
 use crate::p25::freq_table::FreqTable;
 use crate::p25::nid::Duid;
 use crate::p25::trellis::{TrellisStats, trellis_decode_block};
-use crate::p25::tsbk::{Grant, TsbkEvent, parse_tsbk};
+use crate::p25::tsbk::{Grant, GrantKind, TsbkEvent, parse_tsbk};
 
 const SYMBOL_RATE: u32 = 4800;
 /// How often to log a lock-status heartbeat once we've seen our first TSBK.
@@ -38,6 +38,7 @@ struct PendingGrant {
     tgid: u16,
     rid: u32,
     channel_id: u16,
+    kind: GrantKind,
 }
 
 pub struct Decoder {
@@ -132,6 +133,25 @@ impl Decoder {
             stats: DecoderStats::default(),
             last_stats: Instant::now(),
         }
+    }
+
+    /// Wipe the DSP pipeline's IIR/EMA state back to cold-start. Call after a
+    /// retune so stale samples from the prior frequency (still buffered in
+    /// the SDR's URB queue) don't poison the slicer rails, the Gardner loop,
+    /// or the matched-filter history. Frequency-table entries and pending
+    /// grants are kept — they are CC-side state that the retune doesn't
+    /// invalidate.
+    pub fn reset(&mut self) {
+        self.decim.reset();
+        self.disc.reset();
+        self.dc_block.reset();
+        self.matched.reset();
+        self.sync.reset();
+        self.slicer.reset();
+        self.framer.reset();
+        self.tsbk_bits.clear();
+        self.stats = DecoderStats::default();
+        self.last_stats = Instant::now();
     }
 
     pub fn process(&mut self, iq: &[Complex32]) -> Vec<Grant> {
@@ -315,6 +335,7 @@ impl Decoder {
                             channel_id: p.channel_id,
                             dl_hz,
                             ul_hz,
+                            kind: p.kind,
                         };
                         if watched.is_empty() || watched.contains(&g.tgid) {
                             out.push(g);
@@ -393,6 +414,7 @@ fn handle_tsbk_frame(
                             tgid: g.tgid,
                             rid: g.rid,
                             channel_id: g.channel_id,
+                            kind: g.kind,
                         });
                     } else if watched.is_empty() || watched.contains(&g.tgid) {
                         out.push(g);

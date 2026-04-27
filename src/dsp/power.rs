@@ -10,6 +10,17 @@ pub const CHANNEL_HALF_BW_HZ: f32 = 6_250.0;
 /// the noise estimate, where the SDR's anti-alias filter rolls off.
 pub const EDGE_SKIP_FRAC: f32 = 0.0625;
 
+/// Median-to-mean ratio for an exponentially-distributed RV: `median = ln(2)·mean`.
+/// Each FFT bin's `|X[k]|²` is exponential under thermal-noise input, so the
+/// spatial median across out-of-channel bins underestimates the mean by this
+/// factor. Dividing by it converts the median estimator into an unbiased mean
+/// estimator that lines up with the sum-of-bins signal numerator. Strictly
+/// correct only for single-chunk power; per-bin temporal averaging (e.g. the
+/// EMA in [`crate::uplink::dual::DualSdrWatcher`]) drives the per-bin
+/// distribution toward Gaussian and the correction over-shoots modestly
+/// (≤1.5 dB at α=0.1).
+const EXP_MEDIAN_TO_MEAN: f32 = std::f32::consts::LN_2;
+
 /// Converts a linear power ratio to dBFS (full-scale = 1.0 after -1..1 IQ normalization).
 pub fn to_dbfs(power: f32) -> f32 {
     const FLOOR: f32 = 1e-12;
@@ -63,8 +74,10 @@ pub fn fft_bin_power(
 /// Nyquist). Channel sits at `center_bin` with FFT-circular ±`half_bw_bins`
 /// either side. Noise is the median of bins outside the channel and outside
 /// the outermost `edge_skip_bins` near Nyquist (where the SDR's anti-alias
-/// filter rolls off), scaled by `2*half_bw_bins+1` to match channel bandwidth.
-/// Median is robust to other transmitters present elsewhere in the baseband.
+/// filter rolls off), then divided by [`EXP_MEDIAN_TO_MEAN`] to convert the
+/// median to an unbiased mean estimate, then scaled by `2*half_bw_bins+1`
+/// to match channel bandwidth. Median (rather than plain mean) keeps the
+/// estimator robust to other transmitters present elsewhere in the baseband.
 pub fn measure_channel_from_bins(
     bin_power: &[f32],
     center_bin: usize,
@@ -107,7 +120,7 @@ pub fn measure_channel_from_bins(
 
     ChannelMeasurement {
         signal: signal as f32,
-        noise: median * channel_bins as f32,
+        noise: median / EXP_MEDIAN_TO_MEAN * channel_bins as f32,
     }
 }
 
@@ -124,15 +137,23 @@ mod tests {
         vec![level; n]
     }
 
+    /// Expected `noise` field for a flat-spectrum input: `level × channel_bins`
+    /// is the raw median-times-bandwidth result; the 1/ln(2) bias correction
+    /// inflates it because for flat input median == mean and the correction
+    /// over-counts by a constant factor. Real (exponential) noise is verified
+    /// separately in `unbiased_ratio_on_exponential_bin_noise` below.
+    fn flat_noise_estimate(level: f32, channel_bins: usize) -> f32 {
+        level * channel_bins as f32 / std::f32::consts::LN_2
+    }
+
     #[test]
-    fn noise_floor_matches_flat_spectrum() {
+    fn flat_spectrum_signal_matches_sum_and_noise_picks_up_bias_factor() {
         let n = 256;
         let bp = flat_noise(n, 0.001);
         let mut buf = Vec::new();
         let m = measure_channel_from_bins(&bp, 0, 3, 8, &mut buf);
-        // 7 channel bins * 0.001 = 0.007 for each
         assert!((m.signal - 0.007).abs() < 1e-6);
-        assert!((m.noise - 0.007).abs() < 1e-6);
+        assert!((m.noise - flat_noise_estimate(0.001, 7)).abs() < 1e-6);
     }
 
     #[test]
@@ -148,9 +169,8 @@ mod tests {
         }
         let mut buf = Vec::new();
         let m = measure_channel_from_bins(&bp, 0, 3, 8, &mut buf);
-        // Signal: 7 * 0.01 = 0.07; Noise reference: 7 * 0.001 = 0.007
         assert!((m.signal - 0.07).abs() < 1e-6);
-        assert!((m.noise - 0.007).abs() < 1e-6);
+        assert!((m.noise - flat_noise_estimate(0.001, 7)).abs() < 1e-6);
     }
 
     #[test]
@@ -163,6 +183,47 @@ mod tests {
         }
         let mut buf = Vec::new();
         let m = measure_channel_from_bins(&bp, 0, 3, 8, &mut buf);
-        assert!((m.noise - 0.007).abs() < 1e-6);
+        assert!((m.noise - flat_noise_estimate(0.001, 7)).abs() < 1e-6);
+    }
+
+    /// Pure-noise calibration: under exponential per-bin power (the actual
+    /// distribution of `|X[k]|²` for thermal noise after FFT), an unbiased
+    /// noise estimator should give `signal / noise ≈ 1.0` over many trials.
+    /// This pins the 1/ln(2) bias correction; without it the integrated ratio
+    /// sits at ≈ 1.443 (≈ +1.6 dB) and a 4× VAD threshold corresponds to
+    /// only +4.4 dB actual antenna SNR.
+    #[test]
+    fn unbiased_ratio_on_exponential_bin_noise() {
+        let n = 2048;
+        let trials = 500;
+        let half_bw = 6;
+        let edge_skip = (n as f32 * EDGE_SKIP_FRAC) as usize;
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next_uniform = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // Top 32 bits as f32 in (0, 1] — avoid log(0) at the unlucky end.
+            ((state >> 32) as f32 + 1.0) / (u32::MAX as f32 + 2.0)
+        };
+        let mut bp = vec![0.0f32; n];
+        let mut buf = Vec::new();
+        let mut signal_sum = 0.0f64;
+        let mut noise_sum = 0.0f64;
+        for _ in 0..trials {
+            for p in bp.iter_mut() {
+                *p = -next_uniform().ln();
+            }
+            let m = measure_channel_from_bins(&bp, 0, half_bw, edge_skip, &mut buf);
+            signal_sum += m.signal as f64;
+            noise_sum += m.noise as f64;
+        }
+        let ratio = (signal_sum / noise_sum) as f32;
+        // Expected ratio = 1.0; CV per trial ≈ 0.28 (gamma(13)/median dominates),
+        // so 500 trials gives ≈ ±0.013 at one σ. 0.05 is ~4 σ headroom.
+        assert!(
+            (ratio - 1.0).abs() < 0.05,
+            "ratio={ratio} (want ≈1.0)",
+        );
     }
 }

@@ -33,6 +33,16 @@ impl FirDecimator {
         }
     }
 
+    /// Zero the delay line and reset the polyphase counter. Used after a
+    /// retune to keep stale samples out of the convolution window.
+    pub fn reset(&mut self) {
+        for s in self.history.iter_mut() {
+            *s = Complex32::new(0.0, 0.0);
+        }
+        self.write = 0;
+        self.phase = 0;
+    }
+
     pub fn process(&mut self, input: &[Complex32], out: &mut Vec<Complex32>) {
         let n = self.n_taps;
         out.reserve(input.len() / self.decim + 1);

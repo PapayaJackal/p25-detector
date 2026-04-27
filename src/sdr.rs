@@ -159,6 +159,11 @@ mod backend {
         }
 
         fn set_center_hz(&mut self, hz: u32) -> Result<()> {
+            // Same R820T PLL-relock dance as `open()`: a single set_center_freq
+            // sometimes leaves the LO mistuned, with no error surfaced by
+            // librtlsdr. Retuning twice in a row gives the tuner an
+            // already-initialized state to reprogram the VCO from.
+            self.ctl.set_center_freq(hz).ok().context("set_center_freq failed")?;
             self.ctl.set_center_freq(hz).ok().context("set_center_freq failed")
         }
     }

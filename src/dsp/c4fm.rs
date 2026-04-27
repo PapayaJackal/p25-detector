@@ -16,6 +16,10 @@ impl Default for FmDiscriminator {
 }
 
 impl FmDiscriminator {
+    pub fn reset(&mut self) {
+        self.last = Complex32::new(0.0, 0.0);
+    }
+
     pub fn process(&mut self, input: &[Complex32], out: &mut Vec<f32>) {
         for &x in input {
             let prod = x * self.last.conj();
@@ -38,6 +42,11 @@ pub struct DcBlock {
 impl DcBlock {
     pub fn new(alpha: f32) -> Self {
         Self { alpha, last_in: 0.0, last_out: 0.0 }
+    }
+
+    pub fn reset(&mut self) {
+        self.last_in = 0.0;
+        self.last_out = 0.0;
     }
 
     pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
@@ -73,6 +82,13 @@ impl MatchedFilter {
             write: 0,
             n_taps,
         }
+    }
+
+    pub fn reset(&mut self) {
+        for s in self.history.iter_mut() {
+            *s = 0.0;
+        }
+        self.write = 0;
     }
 
     pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
