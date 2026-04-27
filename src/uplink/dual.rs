@@ -8,7 +8,9 @@ use tracing::warn;
 
 use crate::audio::Beeper;
 use crate::config::Mode;
-use crate::dsp::power::to_dbfs;
+use crate::dsp::power::{
+    compute_snr_db, measure_channel_from_bins, to_dbfs, CHANNEL_HALF_BW_HZ, EDGE_SKIP_FRAC,
+};
 use crate::log::{JsonlLogger, Measurement};
 use crate::p25::Grant;
 use crate::sdr::{IqSource, RtlSdr};
@@ -26,6 +28,9 @@ pub struct DualSdrWatcher {
     iq_buf: Vec<Complex32>,
     fft_scratch: Vec<Complex32>,
     bin_power: Vec<f32>,
+    noise_buf: Vec<f32>,
+    half_bw_bins: usize,
+    edge_skip_bins: usize,
     avg_alpha: f32,
     beeper: Option<Beeper>,
 }
@@ -41,6 +46,9 @@ impl DualSdrWatcher {
     ) -> Result<Self> {
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(FFT_SIZE);
+        let bin_width = sample_rate as f32 / FFT_SIZE as f32;
+        let half_bw_bins = (CHANNEL_HALF_BW_HZ / bin_width).ceil() as usize;
+        let edge_skip_bins = (FFT_SIZE as f32 * EDGE_SKIP_FRAC) as usize;
         Ok(Self {
             sdr,
             center_hz,
@@ -51,6 +59,9 @@ impl DualSdrWatcher {
             iq_buf: vec![Complex32::new(0.0, 0.0); 1 << 15],
             fft_scratch: vec![Complex32::new(0.0, 0.0); FFT_SIZE],
             bin_power: vec![0.0f32; FFT_SIZE],
+            noise_buf: Vec::with_capacity(FFT_SIZE),
+            half_bw_bins,
+            edge_skip_bins,
             avg_alpha: 0.1,
             beeper,
         })
@@ -59,11 +70,11 @@ impl DualSdrWatcher {
     pub fn pump(&mut self) -> Result<()> {
         let n = self.sdr.read_iq(&mut self.iq_buf)?;
         let mut i = 0;
+        let norm = (FFT_SIZE as f32).powi(2);
         while i + FFT_SIZE <= n {
             self.fft_scratch
                 .copy_from_slice(&self.iq_buf[i..i + FFT_SIZE]);
             self.fft.process(&mut self.fft_scratch);
-            let norm = (FFT_SIZE as f32).powi(2);
             for (k, c) in self.fft_scratch.iter().enumerate() {
                 let p = c.norm_sqr() / norm;
                 self.bin_power[k] = (1.0 - self.avg_alpha) * self.bin_power[k] + self.avg_alpha * p;
@@ -104,8 +115,14 @@ impl UplinkWatcher for DualSdrWatcher {
             }
         };
 
-        let p = self.bin_power[bin];
-        let rssi = to_dbfs(p);
+        let m = measure_channel_from_bins(
+            &self.bin_power,
+            bin,
+            self.half_bw_bins,
+            self.edge_skip_bins,
+            &mut self.noise_buf,
+        );
+        let snr_db = compute_snr_db(m.signal, m.noise);
 
         self.logger.log(&Measurement {
             ts: Utc::now(),
@@ -113,12 +130,13 @@ impl UplinkWatcher for DualSdrWatcher {
             rid: grant.rid,
             dl_hz: grant.dl_hz as u32,
             ul_hz,
-            rssi_dbfs: rssi,
-            rssi_peak_dbfs: None,
+            channel_dbfs: to_dbfs(m.signal),
+            noise_dbfs: to_dbfs(m.noise),
+            snr_db,
             mode: self.mode,
         });
-        if let Some(b) = &self.beeper {
-            b.beep(rssi);
+        if let (Some(b), Some(snr)) = (&self.beeper, snr_db) {
+            b.beep(snr);
         }
     }
 }

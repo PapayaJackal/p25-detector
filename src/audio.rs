@@ -1,10 +1,11 @@
 //! Audio feedback: short tone on every logged grant.
 //!
-//! Pitch tracks RSSI: louder signal (closer mobile) → higher note. RSSI is
+//! Pitch tracks SNR: cleaner signal (closer mobile) → higher note. SNR is
 //! mapped linearly onto an A-minor pentatonic scale spanning A3–A7 (four
 //! octaves, 20 slots) for good proximity resolution. Amplitude also scales
-//! with RSSI, so distant/likely-out-of-range signals are quiet and reinforce
-//! the low pitch, while close signals are loud and high.
+//! with SNR, so weak/likely-out-of-range signals are quiet and reinforce
+//! the low pitch, while strong signals are loud and high. SNR is used (not
+//! absolute dBFS) so the mapping stays stable across SDR gain settings.
 //!
 //! Single voice: a new beep replaces an in-flight one.
 
@@ -19,8 +20,8 @@ const BEEP_MS: u32 = 260;
 const ATTACK_MS: u32 = 25;
 const RELEASE_MS: u32 = 120;
 
-const RSSI_QUIET_DBFS: f32 = -70.0;
-const RSSI_LOUD_DBFS: f32 = -20.0;
+const SNR_QUIET_DB: f32 = 5.0;
+const SNR_LOUD_DB: f32 = 30.0;
 const AMP_MIN: f32 = 0.04;
 const AMP_MAX: f32 = 0.22;
 
@@ -40,12 +41,12 @@ struct BeepCmd {
 pub struct Beeper {
     tx: Sender<BeepCmd>,
     sample_rate: u32,
-    rssi_min_dbfs: f32,
+    snr_min_db: f32,
     _stream: cpal::Stream,
 }
 
 impl Beeper {
-    pub fn try_new(rssi_min_dbfs: f32) -> Result<Self> {
+    pub fn try_new(snr_min_db: f32) -> Result<Self> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -70,16 +71,16 @@ impl Beeper {
         Ok(Self {
             tx,
             sample_rate,
-            rssi_min_dbfs,
+            snr_min_db,
             _stream: stream,
         })
     }
 
-    pub fn beep(&self, rssi_dbfs: f32) {
-        if !rssi_dbfs.is_finite() || rssi_dbfs < self.rssi_min_dbfs {
+    pub fn beep(&self, snr_db: f32) {
+        if !snr_db.is_finite() || snr_db < self.snr_min_db {
             return;
         }
-        let t = rssi_t(rssi_dbfs);
+        let t = snr_t(snr_db);
         let total = (self.sample_rate * BEEP_MS) / 1000;
         let cmd = BeepCmd {
             freq_hz: tone_for(t),
@@ -169,11 +170,11 @@ impl Oscillator {
     }
 }
 
-fn rssi_t(rssi_dbfs: f32) -> f32 {
-    if !rssi_dbfs.is_finite() {
+fn snr_t(snr_db: f32) -> f32 {
+    if !snr_db.is_finite() {
         return 0.0;
     }
-    ((rssi_dbfs - RSSI_QUIET_DBFS) / (RSSI_LOUD_DBFS - RSSI_QUIET_DBFS)).clamp(0.0, 1.0)
+    ((snr_db - SNR_QUIET_DB) / (SNR_LOUD_DB - SNR_QUIET_DB)).clamp(0.0, 1.0)
 }
 
 fn tone_for(t: f32) -> f32 {
@@ -192,30 +193,30 @@ mod tests {
     #[test]
     fn tones_stay_within_scale_range() {
         let top = BASE_HZ * 2_f32.powi(OCTAVES);
-        for rssi in [-200.0, -70.0, -45.0, -20.0, 0.0, f32::NAN] {
-            let f = tone_for(rssi_t(rssi));
+        for snr in [-50.0, 0.0, 5.0, 18.0, 30.0, 80.0, f32::NAN] {
+            let f = tone_for(snr_t(snr));
             assert!((BASE_HZ..=top).contains(&f), "tone {f} out of range");
         }
     }
 
     #[test]
-    fn louder_rssi_gives_higher_pitch() {
-        assert!(tone_for(rssi_t(-20.0)) > tone_for(rssi_t(-45.0)));
-        assert!(tone_for(rssi_t(-45.0)) > tone_for(rssi_t(-70.0)));
+    fn louder_snr_gives_higher_pitch() {
+        assert!(tone_for(snr_t(28.0)) > tone_for(snr_t(15.0)));
+        assert!(tone_for(snr_t(15.0)) > tone_for(snr_t(7.0)));
     }
 
     #[test]
     fn tone_clamps_at_rails() {
-        assert!((tone_for(rssi_t(-200.0)) - BASE_HZ).abs() < 1e-3);
-        assert!(tone_for(rssi_t(0.0)) > BASE_HZ * 2_f32.powi(OCTAVES - 1));
+        assert!((tone_for(snr_t(-50.0)) - BASE_HZ).abs() < 1e-3);
+        assert!(tone_for(snr_t(80.0)) > BASE_HZ * 2_f32.powi(OCTAVES - 1));
     }
 
     #[test]
-    fn weak_rssi_is_quiet_strong_is_loud() {
-        assert!(rssi_t(-70.0) < 0.01);
-        assert!(rssi_t(-20.0) > 0.99);
-        let quiet = AMP_MIN + rssi_t(-60.0) * (AMP_MAX - AMP_MIN);
-        let loud = AMP_MIN + rssi_t(-25.0) * (AMP_MAX - AMP_MIN);
+    fn weak_snr_is_quiet_strong_is_loud() {
+        assert!(snr_t(5.0) < 0.01);
+        assert!(snr_t(30.0) > 0.99);
+        let quiet = AMP_MIN + snr_t(8.0) * (AMP_MAX - AMP_MIN);
+        let loud = AMP_MIN + snr_t(25.0) * (AMP_MAX - AMP_MIN);
         assert!(loud > quiet * 2.0);
     }
 }
