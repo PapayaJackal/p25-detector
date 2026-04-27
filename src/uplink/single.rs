@@ -333,14 +333,6 @@ impl UplinkWatcher for SingleSdrWatcher {
             warn!(tgid = grant.tgid, rid = grant.rid, ul_hz = grant.ul_hz, "skipping grant with invalid uplink frequency");
             return false;
         }
-        // Mid-call grant updates (GRP_VOICE_GRANT_UPDATE{,_EXPLICIT}) carry no
-        // source RID. The keyup happened on the original grant, so by the time
-        // we retune we'd catch only the tail — or nothing if the call has
-        // already ended. Skip them entirely; we'll measure on the next fresh
-        // grant from this talker.
-        if grant.rid == 0 {
-            return false;
-        }
         if !self.should_measure(grant.tgid) {
             return false;
         }
