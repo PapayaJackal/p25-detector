@@ -15,6 +15,14 @@ pub struct Measurement {
     pub ts: DateTime<Utc>,
     pub tgid: u16,
     pub rid: u32,
+    /// Band-plan identifier (top 4 bits of the TSBK channel ID). Lets you
+    /// tell at a glance which iden table — and thus which band — the grant
+    /// landed on, without back-deriving from `dl_hz`.
+    pub iden: u8,
+    /// Channel number within the iden table (low 12 bits of the TSBK channel
+    /// ID). With `iden` it identifies the band-plan slot the site actually
+    /// transmitted: `dl_hz = base[iden] + channel · step[iden]`.
+    pub channel: u16,
     pub dl_hz: u32,
     pub ul_hz: u32,
     /// Which TSBK opcode produced the grant — distinguishes a fresh
@@ -22,33 +30,53 @@ pub struct Measurement {
     /// progress on retune.
     pub kind: GrantKind,
     /// In-channel power (S+N) in dBFS. For single-SDR mode this is the mean
-    /// over chunks where keyup was detected; for dual-SDR mode it is a
-    /// snapshot from the EMA-smoothed bin powers at grant time.
+    /// over every chunk in the measurement window (keyed or not), so
+    /// `channel_dbfs - noise_dbfs` is meaningful even when `snr_db` is null.
+    /// For dual-SDR mode it is a snapshot from the EMA-smoothed bin powers
+    /// at grant time.
     pub channel_dbfs: f32,
     /// Same-bandwidth noise floor reference (N) in dBFS, estimated from the
     /// median power of out-of-channel bins in the captured baseband.
     pub noise_dbfs: f32,
     /// Signal-to-noise ratio in dB: 10·log10((channel - noise) / noise) in
-    /// linear units. `None` when no keyup was detected within the measurement
-    /// window. Stable across gain settings, unlike the raw dBFS fields.
+    /// linear units. For single-SDR mode, computed from a Welch average
+    /// across all keyed blocks ("how strong was the signal when present",
+    /// integrated for variance). `None` when fewer than `min_keyed_blocks`
+    /// blocks crossed the VAD threshold. Stable across gain settings,
+    /// unlike the raw dBFS fields.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snr_db: Option<f32>,
-    /// Single-SDR-only diagnostic: how many of the FFT chunks in the window
-    /// crossed the VAD threshold. A real keyup looks like a high
-    /// `keyed_count / chunk_count` ratio; a noise-tail VAD trigger sits
-    /// just at the [`MIN_KEYED_CHUNKS`](crate::uplink::single) gate value.
+    /// Single-SDR-only diagnostic: SNR (dB) of the single strongest 50 ms
+    /// block observed in the window. Preserves brief-PTT sensitivity even
+    /// when `snr_db` is null because `min_keyed_blocks` wasn't met.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub keyed_count: Option<u64>,
-    /// Single-SDR-only diagnostic: total FFT chunks measured in the window.
-    /// Smaller than the [`MEASURE_MS`](crate::uplink::single) chunk budget
+    pub peak_block_snr_db: Option<f32>,
+    /// Single-SDR-only diagnostic: how many 50 ms Welch-averaged blocks
+    /// crossed the VAD threshold. A real keyup looks like a high
+    /// `keyed_blocks / block_count` ratio; a marginal trigger sits at or
+    /// just past `min_keyed_blocks`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keyed_blocks: Option<u64>,
+    /// Single-SDR-only diagnostic: total complete blocks measured in the
+    /// window. Smaller than the configured measure-window block budget
     /// when early-exit fired.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub chunk_count: Option<u64>,
-    /// Single-SDR-only diagnostic: maximum single-chunk in-channel/noise
+    pub block_count: Option<u64>,
+    /// Single-SDR-only diagnostic: maximum single-block in-channel/noise
     /// ratio observed. A real keyup hits the tens-to-hundreds; a noise-tail
     /// trigger barely clears the VAD threshold.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_ratio: Option<f32>,
+    /// Single-SDR-only diagnostic: argmax FFT bin (excluding DC) on the
+    /// strongest block. Compare against `expected_bin`: if they differ by
+    /// more than the channel half-bandwidth, the tuner didn't land where
+    /// we asked (or a stronger interferer is dominating the band).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_bin: Option<usize>,
+    /// Single-SDR-only diagnostic: bin where the UL channel center is
+    /// expected to land given `LO_OFFSET_HZ` and the FFT bin width.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_bin: Option<usize>,
     pub mode: Mode,
 }
 

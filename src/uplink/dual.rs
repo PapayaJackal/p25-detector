@@ -10,6 +10,7 @@ use crate::audio::Beeper;
 use crate::config::Mode;
 use crate::dsp::power::{
     compute_snr_db, measure_channel_from_bins, to_dbfs, CHANNEL_HALF_BW_HZ, EDGE_SKIP_FRAC,
+    MEDIAN_BIAS_EXPONENTIAL,
 };
 use crate::log::{JsonlLogger, Measurement};
 use crate::p25::Grant;
@@ -120,6 +121,7 @@ impl UplinkWatcher for DualSdrWatcher {
             bin,
             self.half_bw_bins,
             self.edge_skip_bins,
+            MEDIAN_BIAS_EXPONENTIAL,
             &mut self.noise_buf,
         );
         let snr_db = compute_snr_db(m.signal, m.noise);
@@ -128,15 +130,20 @@ impl UplinkWatcher for DualSdrWatcher {
             ts: Utc::now(),
             tgid: grant.tgid,
             rid: grant.rid,
+            iden: (grant.channel_id >> 12) as u8,
+            channel: grant.channel_id & 0xFFF,
             dl_hz: grant.dl_hz as u32,
             ul_hz,
             kind: grant.kind,
             channel_dbfs: to_dbfs(m.signal),
             noise_dbfs: to_dbfs(m.noise),
             snr_db,
-            keyed_count: None,
-            chunk_count: None,
+            peak_block_snr_db: None,
+            keyed_blocks: None,
+            block_count: None,
             peak_ratio: None,
+            peak_bin: None,
+            expected_bin: None,
             mode: self.mode,
         });
         if let (Some(b), Some(snr)) = (&self.beeper, snr_db) {

@@ -4,7 +4,7 @@
 //! `apps/trunking.py:736-752`. Converts a 16-bit channel ID to a downlink and
 //! uplink frequency in Hz.
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdentEntry {
     pub base_hz: u64,
     pub step_hz: u32,
@@ -23,8 +23,20 @@ impl FreqTable {
     }
 
     pub fn insert(&mut self, iden: u8, entry: IdentEntry) {
-        if iden < 16 {
-            self.entries[iden as usize] = Some(entry);
+        if iden >= 16 {
+            return;
+        }
+        let slot = &mut self.entries[iden as usize];
+        let changed = slot.is_none_or(|prev| prev != entry);
+        *slot = Some(entry);
+        if changed {
+            tracing::info!(
+                iden,
+                base_mhz = entry.base_hz as f64 / 1e6,
+                step_hz = entry.step_hz,
+                offset_mhz = entry.offset_hz as f64 / 1e6,
+                "freq table iden update",
+            );
         }
     }
 

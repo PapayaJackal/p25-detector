@@ -423,6 +423,15 @@ fn handle_tsbk_frame(
                 TsbkEvent::IdentifierUpdate { iden, entry } => {
                     freq_table.insert(iden, entry);
                 }
+                TsbkEvent::UnitRegistration { rid, sid, syid, result } => {
+                    tracing::info!(rid, sid, syid, ?result, "unit registration");
+                }
+                TsbkEvent::UnitDeregistration { rid, syid, wacn } => {
+                    tracing::info!(rid, syid, wacn, "unit deregistration");
+                }
+                TsbkEvent::GroupAffiliation { rid, tgid, result } => {
+                    tracing::info!(rid, tgid, ?result, "group affiliation");
+                }
                 TsbkEvent::Other => {}
             }
         }

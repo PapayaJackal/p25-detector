@@ -55,6 +55,32 @@ pub struct Cli {
     #[arg(long, default_value_t = 5000)]
     pub min_measure_interval_ms: u64,
 
+    /// Single-SDR-only: how long to integrate uplink power per grant, in
+    /// milliseconds. P25 voice calls start ~250–500 ms after the grant and
+    /// voice frames are 180 ms apiece, so the default 600 ms catches the
+    /// first 2–3 frames; longer windows catch late keyups and short bursts
+    /// at the cost of more time off the control channel.
+    #[arg(long, default_value_t = 600)]
+    pub measure_window_ms: u64,
+
+    /// Single-SDR-only: per-block linear (S+N)/N ratio above which a 50 ms
+    /// Welch-averaged block counts as "keyed". With ~60 chunks per block
+    /// the per-block CV ≈ 0.036, so 1.5 (≈ +1.8 dB above noise) is ~14 σ —
+    /// false positives are negligible while still catching real signals
+    /// down to ~+1 dB antenna SNR. Lower toward 1.1 if you're chasing very
+    /// faint transmitters.
+    #[arg(long, default_value_t = 1.5)]
+    pub vad_threshold: f32,
+
+    /// Single-SDR-only: minimum number of keyed *blocks* (50 ms Welch
+    /// averages) required before the keyed-segment `snr_db` is reported.
+    /// 4 blocks ≈ 200 ms of activity, giving the keyed-segment Welch sum
+    /// ~1500 chunk-equivalents and SNR precision ≈ 0.4 dB. Drop to 1 to
+    /// surface single-block PTT bursts (or just consult the always-reported
+    /// `peak_block_snr_db` field for the strongest single block).
+    #[arg(long, default_value_t = 4)]
+    pub min_keyed_blocks: u64,
+
     /// Output log path. `-` or omitted means stdout.
     #[arg(long)]
     pub log: Option<PathBuf>,
@@ -81,6 +107,9 @@ pub struct RuntimeConfig {
     pub ppm: i32,
     pub watched_tgids: Vec<u16>,
     pub min_measure_interval_ms: u64,
+    pub measure_window_ms: u64,
+    pub vad_threshold: f32,
+    pub min_keyed_blocks: u64,
     pub log_path: Option<PathBuf>,
     pub beep: bool,
     pub beep_snr_min_db: f32,
@@ -112,6 +141,9 @@ impl Cli {
             ppm: self.ppm,
             watched_tgids: self.watch_tgid,
             min_measure_interval_ms: self.min_measure_interval_ms,
+            measure_window_ms: self.measure_window_ms,
+            vad_threshold: self.vad_threshold,
+            min_keyed_blocks: self.min_keyed_blocks,
             log_path,
             beep: !self.no_beep,
             beep_snr_min_db: self.beep_snr_min.unwrap_or(f32::NEG_INFINITY),

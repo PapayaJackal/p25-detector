@@ -12,7 +12,7 @@ use crate::audio::Beeper;
 use crate::config::Mode;
 use crate::dsp::power::{
     compute_snr_db, fft_bin_power, measure_channel_from_bins, to_dbfs, CHANNEL_HALF_BW_HZ,
-    EDGE_SKIP_FRAC,
+    EDGE_SKIP_FRAC, MEDIAN_BIAS_AVERAGED,
 };
 use crate::log::{JsonlLogger, Measurement};
 use crate::p25::Grant;
@@ -27,35 +27,18 @@ use crate::uplink::UplinkWatcher;
 /// samples reach the downstream IIR/EMAs and either retrains them on the
 /// wrong frequency (CC return) or biases the FFT power estimate (UL).
 const RETUNE_SETTLE_MS: u64 = 250;
-/// Window over which we integrate uplink power. P25 voice calls start
-/// roughly 250–500 ms after the grant and voice frames are 180 ms apiece, so
-/// a 200 ms window frequently misses the key-up entirely. 600 ms catches the
-/// first 2–3 voice frames in practice; VAD then picks out the keyed portion.
-const MEASURE_MS: u64 = 600;
 /// FFT length for in-channel/noise extraction. Bin width = sample_rate /
 /// FFT_SIZE; chosen so the bin width stays well below the P25 12.5 kHz
 /// channel raster across plausible SDR sample rates.
 const FFT_SIZE: usize = 2048;
-/// VAD threshold (linear): a chunk is considered keyed if in-channel power
-/// exceeds the (bias-corrected) noise reference by this factor. The noise
-/// estimator is unbiased after the median→mean correction in
-/// [`crate::dsp::power`], so the threshold is the actual antenna-side
-/// `(S+N)/N` ratio. 4.0 ≈ +6 dB — comfortably above the per-chunk noise
-/// tail (13-bin sum has CV ≈ 0.28, so a noise-only chunk crosses 4× at
-/// ~10 σ — astronomically rare).
-///
-/// The threshold is now only a *presence detector*: it gates whether a
-/// grant gets an SNR reported at all. The reported SNR itself is computed
-/// over every chunk in the window (keyed or not), which sidesteps the
-/// conditional-mean floor a hard threshold would otherwise create
-/// (`floor_dB ≈ 10·log10(T-1)`: T=4 → +4.8 dB, T=8 → +8.5 dB) on grants
-/// whose UL is just barely above the threshold.
-const VAD_THRESHOLD_LINEAR: f32 = 4.0;
-/// Once VAD has accepted this many FFT chunks, the in-channel mean has
-/// converged within ~0.1 dB (CV ≈ 1/√(N · channel_bins)) and further
-/// integration just delays our return to the control channel. The window is
-/// still capped at MEASURE_MS for the case where keyup never happens.
-const MIN_KEYED_CHUNKS: u64 = 80;
+/// Block length (in milliseconds) over which we Welch-average bin powers
+/// before applying the VAD threshold. 50 ms is the sweet spot: long enough
+/// to drop per-bin variance to CV ≈ 0.036 (`1/√60` channel-bin samples),
+/// short enough to track P25 voice frames (180 ms apiece) and PTT bursts.
+const BLOCK_MS: u64 = 50;
+/// Number of FFT chunks per Welch-averaged block. Derived from
+/// [`SAMPLE_RATE`] and [`BLOCK_MS`] / `FFT_SIZE`. ≈ 58 at 2.4 Msps.
+const BLOCK_CHUNKS: usize = (SAMPLE_RATE as usize) * (BLOCK_MS as usize) / 1000 / FFT_SIZE;
 /// Baseband offset at which we place the UL channel of interest after
 /// retuning. The LO itself is set to `ul_hz - LO_OFFSET_HZ` so the channel
 /// lands at this positive baseband frequency rather than at DC. RTL-SDR's
@@ -71,6 +54,9 @@ pub struct SingleSdrWatcher {
     sdr: RtlSdr,
     cc_freq_hz: u32,
     min_interval: Duration,
+    measure_window_ms: u64,
+    vad_threshold: f32,
+    min_keyed_blocks: u64,
     last_measurement: HashMap<u16, Instant>,
     logger: JsonlLogger,
     mode: Mode,
@@ -78,6 +64,15 @@ pub struct SingleSdrWatcher {
     fft: Arc<dyn Fft<f32>>,
     fft_scratch: Vec<Complex32>,
     bin_power: Vec<f32>,
+    /// Per-block accumulator: sums per-bin power across the `BLOCK_CHUNKS`
+    /// chunks of the current block, then divides to form a Welch-averaged
+    /// spectrum for that block before VAD thresholding. Reset between blocks.
+    block_bin_sum: Vec<f32>,
+    /// Welch sum across blocks that passed the VAD threshold. Each summand
+    /// is itself a per-block averaged spectrum, so dividing by `keyed_blocks`
+    /// at the end produces a low-variance averaged spectrum used for the
+    /// final SNR. Reset between measurements.
+    keyed_bin_sum: Vec<f32>,
     noise_buf: Vec<f32>,
     half_bw_bins: usize,
     edge_skip_bins: usize,
@@ -88,26 +83,42 @@ pub struct SingleSdrWatcher {
 }
 
 struct UplinkSnapshot {
+    /// Mean in-channel power (dBFS) across every block in the window —
+    /// keyed or not — so a sub-gate signal still shows up as a small
+    /// `channel_dbfs - noise_dbfs` gap.
     channel_dbfs: f32,
+    /// Mean same-bandwidth noise reference (dBFS) across every block.
     noise_dbfs: f32,
+    /// SNR (dB) computed from the keyed-block Welch-averaged spectrum, i.e.
+    /// "how strong was the signal *when present*". `None` when fewer than
+    /// `min_keyed_blocks` blocks crossed the VAD threshold.
     snr_db: Option<f32>,
-    /// FFT chunks during the measurement window whose in-channel/noise ratio
-    /// exceeded [`VAD_THRESHOLD_LINEAR`].
-    keyed_count: u64,
-    /// FFT chunks measured (early-exit when [`MIN_KEYED_CHUNKS`] is reached
-    /// shortens this; otherwise it's [`MEASURE_MS`] worth of chunks).
-    chunk_count: u64,
-    /// Largest single-chunk in-channel/noise ratio observed in the window.
-    /// A real keyup hits the tens-to-hundreds; a noise-tail VAD trigger
-    /// barely clears [`VAD_THRESHOLD_LINEAR`].
+    /// SNR (dB) of the single best block observed in the window. Preserves
+    /// brief-PTT-burst sensitivity that the keyed-block-averaged `snr_db`
+    /// would lose if only one block crossed and was integrated alone.
+    peak_block_snr_db: Option<f32>,
+    /// Welch-averaged blocks (50 ms each) whose in-channel/noise ratio
+    /// crossed `vad_threshold`.
+    keyed_blocks: u64,
+    /// Total complete blocks measured in the window.
+    block_count: u64,
+    /// Largest single-block in-channel/noise ratio observed.
     peak_ratio: f32,
+    /// Argmax bin (excluding DC) on the strongest block. For a
+    /// correctly-tuned UL the peak should land within `center_bin ±
+    /// half_bw_bins`.
+    peak_bin: usize,
 }
 
 impl SingleSdrWatcher {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         sdr: RtlSdr,
         cc_freq_hz: u32,
         min_measure_interval_ms: u64,
+        measure_window_ms: u64,
+        vad_threshold: f32,
+        min_keyed_blocks: u64,
         logger: JsonlLogger,
         mode: Mode,
         beeper: Option<Beeper>,
@@ -122,6 +133,9 @@ impl SingleSdrWatcher {
             sdr,
             cc_freq_hz,
             min_interval: Duration::from_millis(min_measure_interval_ms),
+            measure_window_ms,
+            vad_threshold,
+            min_keyed_blocks,
             last_measurement: HashMap::new(),
             logger,
             mode,
@@ -129,6 +143,8 @@ impl SingleSdrWatcher {
             fft,
             fft_scratch: vec![Complex32::new(0.0, 0.0); FFT_SIZE],
             bin_power: vec![0.0f32; FFT_SIZE],
+            block_bin_sum: vec![0.0f32; FFT_SIZE],
+            keyed_bin_sum: vec![0.0f32; FFT_SIZE],
             noise_buf: Vec::with_capacity(FFT_SIZE),
             half_bw_bins,
             edge_skip_bins,
@@ -173,13 +189,20 @@ impl SingleSdrWatcher {
         self.sdr.set_center_hz(lo_hz)?;
         self.drain_post_retune()?;
 
-        let total_needed = (SAMPLE_RATE as u64 * MEASURE_MS / 1000) as usize;
+        // Reset per-measurement Welch accumulators.
+        self.block_bin_sum.fill(0.0);
+        self.keyed_bin_sum.fill(0.0);
+
+        let total_needed = (SAMPLE_RATE as u64 * self.measure_window_ms / 1000) as usize;
         let mut collected = 0usize;
-        let mut signal_sum = 0.0f64;
-        let mut noise_sum = 0.0f64;
-        let mut chunk_count = 0u64;
-        let mut keyed_count = 0u64;
+        let mut chunks_in_block = 0usize;
+        let mut block_count = 0u64;
+        let mut keyed_blocks = 0u64;
+        let mut window_signal_sum = 0.0f64;
+        let mut window_noise_sum = 0.0f64;
         let mut peak_ratio = 0.0f32;
+        let mut peak_block_snr_db: Option<f32> = None;
+        let mut peak_bin = self.center_bin;
 
         'outer: while collected < total_needed {
             let n = self.sdr.read_iq(&mut self.iq_buf)?;
@@ -194,61 +217,112 @@ impl SingleSdrWatcher {
                     &mut self.fft_scratch,
                     &mut self.bin_power,
                 );
-                let m = measure_channel_from_bins(
-                    &self.bin_power,
-                    self.center_bin,
-                    self.half_bw_bins,
-                    self.edge_skip_bins,
-                    &mut self.noise_buf,
-                );
-                signal_sum += m.signal as f64;
-                noise_sum += m.noise as f64;
-                chunk_count += 1;
-                let ratio = if m.noise > 0.0 { m.signal / m.noise } else { 0.0 };
-                if ratio > peak_ratio {
-                    peak_ratio = ratio;
+                for (acc, p) in self.block_bin_sum.iter_mut().zip(self.bin_power.iter()) {
+                    *acc += *p;
                 }
-                if ratio > VAD_THRESHOLD_LINEAR {
-                    keyed_count += 1;
-                    if keyed_count >= MIN_KEYED_CHUNKS {
+                chunks_in_block += 1;
+                i += FFT_SIZE;
+
+                if chunks_in_block >= BLOCK_CHUNKS {
+                    // Finalize this block: divide the per-bin sum by the chunk
+                    // count to get a Welch-averaged spectrum, then derive
+                    // signal/noise from it. The averaged spectrum has per-bin
+                    // CV ≈ 1/√BLOCK_CHUNKS (~0.13 at 60 chunks) versus the
+                    // single-chunk 1.0, dropping the channel-bin sum's CV
+                    // from ~0.28 to ~0.04 — that's why the VAD threshold can
+                    // be set close to 1 without false-positives.
+                    let inv = 1.0 / chunks_in_block as f32;
+                    for p in self.block_bin_sum.iter_mut() {
+                        *p *= inv;
+                    }
+                    let m = measure_channel_from_bins(
+                        &self.block_bin_sum,
+                        self.center_bin,
+                        self.half_bw_bins,
+                        self.edge_skip_bins,
+                        MEDIAN_BIAS_AVERAGED,
+                        &mut self.noise_buf,
+                    );
+                    let ratio = if m.noise > 0.0 { m.signal / m.noise } else { 0.0 };
+                    block_count += 1;
+                    window_signal_sum += m.signal as f64;
+                    window_noise_sum += m.noise as f64;
+
+                    if ratio > peak_ratio {
+                        peak_ratio = ratio;
+                        peak_bin = argmax_bin_excl_dc(&self.block_bin_sum);
+                        // Only report a peak SNR when the block actually
+                        // cleared the VAD gate. Otherwise we'd be reporting
+                        // 10·log10(noise_max_ratio − 1) for whatever noise
+                        // spike happened to be loudest — meaningless and
+                        // visually indistinguishable from a real weak signal.
+                        peak_block_snr_db = if ratio > self.vad_threshold {
+                            compute_snr_db(m.signal, m.noise)
+                        } else {
+                            None
+                        };
+                    }
+
+                    if ratio > self.vad_threshold {
+                        keyed_blocks += 1;
+                        for (k, b) in self.keyed_bin_sum.iter_mut().zip(self.block_bin_sum.iter())
+                        {
+                            *k += *b;
+                        }
+                    }
+
+                    self.block_bin_sum.fill(0.0);
+                    chunks_in_block = 0;
+
+                    if keyed_blocks >= self.min_keyed_blocks {
                         break 'outer;
                     }
                 }
-                i += FFT_SIZE;
             }
             collected += n;
         }
 
-        let mean_noise = if chunk_count > 0 {
-            (noise_sum / chunk_count as f64) as f32
+        let (mean_signal, mean_noise) = if block_count > 0 {
+            let n = block_count as f64;
+            (
+                (window_signal_sum / n) as f32,
+                (window_noise_sum / n) as f32,
+            )
         } else {
-            0.0
+            (0.0, 0.0)
         };
-        // Population mean over *every* chunk in the window — keyed or not —
-        // to avoid the conditional-mean floor a hard VAD cut would impose.
-        // The threshold's only job is gating whether SNR gets reported at
-        // all; the SNR value itself is the unbiased average channel power
-        // divided by the unbiased average noise. Side-effect: brief calls
-        // see SNR scaled by their duty cycle in the window, which is the
-        // honest answer (you really did receive less energy).
-        let mean_signal = if chunk_count > 0 {
-            (signal_sum / chunk_count as f64) as f32
+
+        // Final SNR: Welch-average the keyed-block spectra (already each a
+        // Welch average over BLOCK_CHUNKS chunks → effective shape
+        // ≥ BLOCK_CHUNKS·keyed_blocks, well past the regime where median ≈
+        // mean) and re-extract signal/noise from the averaged spectrum.
+        let snr_db = if keyed_blocks >= self.min_keyed_blocks {
+            let inv = 1.0 / keyed_blocks as f32;
+            for p in self.keyed_bin_sum.iter_mut() {
+                *p *= inv;
+            }
+            let m = measure_channel_from_bins(
+                &self.keyed_bin_sum,
+                self.center_bin,
+                self.half_bw_bins,
+                self.edge_skip_bins,
+                MEDIAN_BIAS_AVERAGED,
+                &mut self.noise_buf,
+            );
+            compute_snr_db(m.signal, m.noise)
         } else {
-            0.0
-        };
-        let (channel_lin, snr_db) = if keyed_count >= MIN_KEYED_CHUNKS {
-            (mean_signal, compute_snr_db(mean_signal, mean_noise))
-        } else {
-            (mean_noise, None)
+            None
         };
 
         Ok(UplinkSnapshot {
-            channel_dbfs: to_dbfs(channel_lin),
+            channel_dbfs: to_dbfs(mean_signal),
             noise_dbfs: to_dbfs(mean_noise),
             snr_db,
-            keyed_count,
-            chunk_count,
+            peak_block_snr_db,
+            keyed_blocks,
+            block_count,
             peak_ratio,
+            peak_bin,
         })
     }
 }
@@ -257,6 +331,14 @@ impl UplinkWatcher for SingleSdrWatcher {
     fn on_grant(&mut self, grant: Grant) -> bool {
         if grant.ul_hz == 0 || grant.ul_hz > u32::MAX as u64 {
             warn!(tgid = grant.tgid, rid = grant.rid, ul_hz = grant.ul_hz, "skipping grant with invalid uplink frequency");
+            return false;
+        }
+        // Mid-call grant updates (GRP_VOICE_GRANT_UPDATE{,_EXPLICIT}) carry no
+        // source RID. The keyup happened on the original grant, so by the time
+        // we retune we'd catch only the tail — or nothing if the call has
+        // already ended. Skip them entirely; we'll measure on the next fresh
+        // grant from this talker.
+        if grant.rid == 0 {
             return false;
         }
         if !self.should_measure(grant.tgid) {
@@ -298,9 +380,12 @@ impl UplinkWatcher for SingleSdrWatcher {
             channel_dbfs = snap.channel_dbfs,
             noise_dbfs = snap.noise_dbfs,
             snr_db = snap.snr_db.unwrap_or(f32::NAN),
-            keyed = snap.keyed_count,
-            chunks = snap.chunk_count,
+            peak_block_snr_db = snap.peak_block_snr_db.unwrap_or(f32::NAN),
+            keyed_blocks = snap.keyed_blocks,
+            blocks = snap.block_count,
             peak_ratio = snap.peak_ratio,
+            peak_bin = snap.peak_bin,
+            expected_bin = self.center_bin,
             "uplink measured",
         );
 
@@ -309,15 +394,20 @@ impl UplinkWatcher for SingleSdrWatcher {
             ts: Utc::now(),
             tgid: grant.tgid,
             rid: grant.rid,
+            iden: (grant.channel_id >> 12) as u8,
+            channel: grant.channel_id & 0xFFF,
             dl_hz: grant.dl_hz as u32,
             ul_hz: grant.ul_hz as u32,
             kind: grant.kind,
             channel_dbfs: snap.channel_dbfs,
             noise_dbfs: snap.noise_dbfs,
             snr_db: snap.snr_db,
-            keyed_count: Some(snap.keyed_count),
-            chunk_count: Some(snap.chunk_count),
+            peak_block_snr_db: snap.peak_block_snr_db,
+            keyed_blocks: Some(snap.keyed_blocks),
+            block_count: Some(snap.block_count),
             peak_ratio: Some(snap.peak_ratio),
+            peak_bin: Some(snap.peak_bin),
+            expected_bin: Some(self.center_bin),
             mode: self.mode,
         });
         if let (Some(b), Some(snr)) = (&self.beeper, snap.snr_db) {
@@ -325,4 +415,25 @@ impl UplinkWatcher for SingleSdrWatcher {
         }
         true
     }
+}
+
+/// Argmax of `bin_power` excluding the DC self-mix region (bins 0..3 and
+/// the wrap-around mirror N-3..N). Used as a one-shot alignment check on
+/// the block that produced `peak_ratio`: if the loudest non-DC bin sits
+/// far from `center_bin`, the SDR didn't tune where we asked.
+fn argmax_bin_excl_dc(bin_power: &[f32]) -> usize {
+    const DC_GUARD: usize = 3;
+    let n = bin_power.len();
+    let mut best_idx = DC_GUARD;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &p) in bin_power.iter().enumerate() {
+        if i < DC_GUARD || i + DC_GUARD >= n {
+            continue;
+        }
+        if p > best_val {
+            best_val = p;
+            best_idx = i;
+        }
+    }
+    best_idx
 }

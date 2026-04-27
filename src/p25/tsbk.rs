@@ -20,6 +20,32 @@ mod opcode {
     pub const TELE_INT_VOICE_GRANT_UPDATE: u8 = 0x09;
     pub const IDENTIFIER_UPDATE_VHF_UHF: u8 = 0x34;
     pub const IDENTIFIER_UPDATE: u8 = 0x3D;
+    pub const GROUP_AFFILIATION_RESPONSE: u8 = 0x28;
+    pub const UNIT_REGISTRATION_RESPONSE: u8 = 0x2C;
+    pub const UNIT_DEREGISTRATION_ACK: u8 = 0x2F;
+}
+
+/// Outbound registration/affiliation result code (TIA-102.AABF). The value
+/// is broadcast in the TSBK so other listeners can tell whether a unit was
+/// actually accepted by the site or bounced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RegResult {
+    Accept,
+    Fail,
+    Deny,
+    Refused,
+}
+
+impl RegResult {
+    fn from_bits(v: u8) -> Self {
+        match v & 0x3 {
+            0 => RegResult::Accept,
+            1 => RegResult::Fail,
+            2 => RegResult::Deny,
+            _ => RegResult::Refused,
+        }
+    }
 }
 
 /// Motorola manufacturer ID — uses a different field layout for grants and is ignored.
@@ -58,6 +84,17 @@ pub struct Grant {
 pub enum TsbkEvent {
     Grant(Grant),
     IdentifierUpdate { iden: u8, entry: IdentEntry },
+    /// Unit-registration response (opcode 0x2C). The site has just told a
+    /// radio whether its registration request was accepted; on accept the
+    /// radio is now homed on this site and its grants will originate here.
+    UnitRegistration { rid: u32, sid: u32, syid: u16, result: RegResult },
+    /// Unit-deregistration acknowledge (opcode 0x2F). The radio has left
+    /// the site (or powered down) and its previous affiliations are stale.
+    UnitDeregistration { rid: u32, syid: u16, wacn: u32 },
+    /// Group-affiliation response (opcode 0x28). A radio just affiliated
+    /// (or attempted to) with a talkgroup at this site; on accept the site
+    /// will start issuing grants for that TG when any member keys up.
+    GroupAffiliation { rid: u32, tgid: u16, result: RegResult },
     Other,
 }
 
@@ -114,9 +151,36 @@ pub fn parse_tsbk(block: &[u8; 12], freq_table: &FreqTable) -> Option<TsbkEvent>
             let sa = ((tsbk >> 16) & 0xFF_FFFF) as u32;
             build_grant(ch, 0, sa, freq_table, GrantKind::TelephoneInterconnectGrantUpdate)
         }
-        // VHF/UHF variant has the same identifier-update layout as the wide-area form.
-        opcode::IDENTIFIER_UPDATE | opcode::IDENTIFIER_UPDATE_VHF_UHF => {
-            parse_identifier_update(tsbk)
+        opcode::IDENTIFIER_UPDATE => parse_identifier_update(tsbk),
+        // VHF/UHF iden_up has a different layout from the wide-area form:
+        // 14-bit signed `toff` (vs 9 bits) and offset = toff * step instead
+        // of toff * 250 kHz. Cross-checked against OP25 trunking.py:701-715.
+        opcode::IDENTIFIER_UPDATE_VHF_UHF => parse_identifier_update_vu(tsbk),
+        // Layouts cross-checked against OP25 trunking.py:636-672.
+        // 0x28 grp_aff_rsp: gav[72..74], ga[40..56], ta[16..40].
+        opcode::GROUP_AFFILIATION_RESPONSE if mfrid == 0 => {
+            let gav = ((tsbk >> 72) & 0x3) as u8;
+            let tgid = ((tsbk >> 40) & 0xFFFF) as u16;
+            let rid = ((tsbk >> 16) & 0xFF_FFFF) as u32;
+            Some(TsbkEvent::GroupAffiliation { rid, tgid, result: RegResult::from_bits(gav) })
+        }
+        // 0x2C u_reg_rsp: rv[76..78], syid[64..76], sid[40..64], sa[16..40].
+        // `sid` is the system-wide unit ID assigned by the site; `sa` is
+        // the source address the radio claimed in its request — that's the
+        // RID we report so it lines up with grant logs.
+        opcode::UNIT_REGISTRATION_RESPONSE if mfrid == 0 => {
+            let rv = ((tsbk >> 76) & 0x3) as u8;
+            let syid = ((tsbk >> 64) & 0xFFF) as u16;
+            let sid = ((tsbk >> 40) & 0xFF_FFFF) as u32;
+            let rid = ((tsbk >> 16) & 0xFF_FFFF) as u32;
+            Some(TsbkEvent::UnitRegistration { rid, sid, syid, result: RegResult::from_bits(rv) })
+        }
+        // 0x2F u_de_reg_ack: wacn[52..72], syid[40..52], sid[16..40].
+        opcode::UNIT_DEREGISTRATION_ACK if mfrid == 0 => {
+            let wacn = ((tsbk >> 52) & 0xF_FFFF) as u32;
+            let syid = ((tsbk >> 40) & 0xFFF) as u16;
+            let rid = ((tsbk >> 16) & 0xFF_FFFF) as u32;
+            Some(TsbkEvent::UnitDeregistration { rid, syid, wacn })
         }
         _ => Some(TsbkEvent::Other),
     }
@@ -148,6 +212,39 @@ fn parse_identifier_update(tsbk: u128) -> Option<TsbkEvent> {
         entry: IdentEntry {
             base_hz: freq * 5,
             step_hz: spac * 125,
+            offset_hz,
+        },
+    })
+}
+
+/// VHF/UHF identifier-update (TSBK opcode 0x34). Layout per
+/// OP25 `apps/trunking.py:701-715`:
+///   iden  : bits 76..80
+///   bwvu  : bits 72..76 (channel bandwidth code; unused here)
+///   toff0 : bits 58..72 (14 bits)
+///   spac  : bits 48..58 (10 bits, 125-Hz units)
+///   freq  : bits 16..48 (32 bits, 5-Hz units)
+/// Inside `toff0` the high bit is the sign (1 = positive offset, i.e. UL
+/// above DL) and the low 13 bits are the magnitude in `step_hz` units, so
+/// the offset is `±toff_mag · step_hz`. This differs from the wide-area
+/// 0x3D layout, where toff is 8 bits in 250-kHz units; using the wrong
+/// parser on a VHF/UHF system would produce wildly wrong UL frequencies.
+fn parse_identifier_update_vu(tsbk: u128) -> Option<TsbkEvent> {
+    let iden = ((tsbk >> 76) & 0xF) as u8;
+    let toff0 = ((tsbk >> 58) & 0x3FFF) as u32;
+    let spac = ((tsbk >> 48) & 0x3FF) as u32;
+    let freq = ((tsbk >> 16) & 0xFFFF_FFFF) as u64;
+
+    let sign_positive = (toff0 >> 13) & 1 != 0;
+    let toff_mag = (toff0 & 0x1FFF) as i64;
+    let step_hz = spac * 125;
+    let offset_hz = toff_mag * step_hz as i64 * if sign_positive { 1 } else { -1 };
+
+    Some(TsbkEvent::IdentifierUpdate {
+        iden,
+        entry: IdentEntry {
+            base_hz: freq * 5,
+            step_hz,
             offset_hz,
         },
     })
@@ -245,8 +342,8 @@ mod tests {
             (0, 2, 0b10),               // LB=1, P=0
             (2, 6, 0x04),               // opcode UU_VOICE_GRANT
             (8, 8, 0),                  // mfid
-            (16, 16, (1u64 << 12) | 0), // ch: iden=1, channel=0
-            (32, 24, 0xCAFE_42),        // target RID
+            (16, 16, 1u64 << 12),       // ch: iden=1, channel=0
+            (32, 24, 0x00CA_FE42),      // target RID
             (56, 24, 0x12_3456),        // source RID (the talker)
         ]);
         match parse_tsbk(&block, &nspac_iden()).unwrap() {
@@ -309,10 +406,12 @@ mod tests {
     #[test]
     fn parses_identifier_update() {
         // Opcode 0x3D with negative (sign=0) 45 MHz offset (180 * 250 kHz).
-        // Layout: bits [95:90]=opcode, [89:88]=reserved, [87:80]=mfrid,
-        //         [79:76]=iden, [75:67]=bw (9b),
-        //         [66:58]=toff (9b: sign + 8-bit magnitude),
-        //         [57:48]=spac (10b), [47:16]=base*5 Hz (32b), [15:0]=CRC.
+        // Layout (block bit 0 = block[0] MSB; opcode lives in the low 6 bits
+        // of block[0], i.e. u128 bits 88..94 after pack_96):
+        //   [95]=LB, [94]=P, [93:88]=opcode, [87:80]=mfrid,
+        //   [79:76]=iden, [75:67]=bw (9b),
+        //   [66:58]=toff (9b: sign + 8-bit magnitude),
+        //   [57:48]=spac (10b), [47:16]=base*5 Hz (32b), [15:0]=CRC.
         let iden: u32 = 1;
         let bw: u32 = 0b0_0011_1000; // 9 bits; value doesn't affect our test
         let sign_positive: u32 = 0; // uplink below downlink
@@ -322,8 +421,8 @@ mod tests {
         let freq: u32 = 851_000_000 / 5;
 
         let mut v: u128 = 0;
-        v |= 0x3D << 90; // opcode (6b) at [95:90]
-        // [89:88] reserved = 0
+        v |= (0x3Du128) << 88; // opcode (6b) at [93:88]
+        // [95:94] LB/P = 0
         // [87:80] mfrid = 0
         v |= (iden as u128) << 76; // 4 bits
         v |= (bw as u128 & 0x1FF) << 67; // 9 bits
@@ -343,6 +442,121 @@ mod tests {
                 assert_eq!(entry.base_hz, 851_000_000);
                 assert_eq!(entry.step_hz, 100 * 125);
                 assert_eq!(entry.offset_hz, -45_000_000);
+            }
+            other => panic!("expected IdentifierUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_unit_registration_response() {
+        // OP25 layout: rv bits 76..78, syid 64..76, sid 40..64, sa 16..40
+        // (low-bit offsets in the u128). In sdrtrunk-style start-bit-from-MSB
+        // terms after the mfrid byte, that's a 2-bit reserved gap, rv, syid,
+        // sid, sa.
+        let block = build_block(&[
+            (0, 2, 0b10),
+            (2, 6, 0x2C),
+            (8, 8, 0),                  // mfid
+            (16, 2, 0),                 // reserved
+            (18, 2, 0),                 // rv = Accept
+            (20, 12, 0xABC),            // syid
+            (32, 24, 0x33_4455),        // sid (assigned)
+            (56, 24, 0x12_3456),        // sa (claimed RID)
+        ]);
+        match parse_tsbk(&block, &nspac_iden()).unwrap() {
+            TsbkEvent::UnitRegistration { rid, sid, syid, result } => {
+                assert_eq!(rid, 0x12_3456);
+                assert_eq!(sid, 0x33_4455);
+                assert_eq!(syid, 0xABC);
+                assert_eq!(result, RegResult::Accept);
+            }
+            other => panic!("expected UnitRegistration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_unit_deregistration_ack() {
+        // OP25 layout: wacn bits 52..72, syid 40..52, sid 16..40 (low-bit
+        // offsets in the u128). After mfrid that's an 8-bit reserved gap,
+        // then wacn, syid, sid back-to-back.
+        let block = build_block(&[
+            (0, 2, 0b10),
+            (2, 6, 0x2F),
+            (8, 8, 0),                  // mfid
+            (16, 8, 0),                 // reserved
+            (24, 20, 0xB_EEFA),         // wacn
+            (44, 12, 0x123),            // syid
+            (56, 24, 0x77_8899),        // sid (RID)
+        ]);
+        match parse_tsbk(&block, &nspac_iden()).unwrap() {
+            TsbkEvent::UnitDeregistration { rid, syid, wacn } => {
+                assert_eq!(rid, 0x77_8899);
+                assert_eq!(syid, 0x123);
+                assert_eq!(wacn, 0xBEEFA);
+            }
+            other => panic!("expected UnitDeregistration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_group_affiliation_response() {
+        let block = build_block(&[
+            (0, 2, 0b10),
+            (2, 6, 0x28),
+            (8, 8, 0),                  // mfid
+            (16, 1, 0),                 // lg
+            (17, 5, 0),                 // reserved
+            (22, 2, 0b10),              // gav = Deny
+            (24, 16, 0xAAAA),           // aga (announce group, ignored)
+            (40, 16, 0x0042),           // ga (TGID)
+            (56, 24, 0x12_3456),        // ta (RID)
+        ]);
+        match parse_tsbk(&block, &nspac_iden()).unwrap() {
+            TsbkEvent::GroupAffiliation { rid, tgid, result } => {
+                assert_eq!(rid, 0x12_3456);
+                assert_eq!(tgid, 0x0042);
+                assert_eq!(result, RegResult::Deny);
+            }
+            other => panic!("expected GroupAffiliation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_identifier_update_vu() {
+        // Opcode 0x34 (VHF/UHF). Layout per OP25:
+        //   [79:76]=iden, [75:72]=bwvu (4b), [71:58]=toff0 (14b: sign + 13b mag),
+        //   [57:48]=spac (10b), [47:16]=base*5 Hz (32b).
+        // Build a representative VHF entry: base 159.0 MHz, 12.5 kHz step,
+        // -5 MHz offset (UL below DL by 5 MHz). At step=12.5 kHz the offset
+        // magnitude is 5_000_000 / 12_500 = 400 step-units.
+        let iden: u32 = 2;
+        let bwvu: u32 = 0b0100; // 4 bits; value doesn't affect our test
+        let sign_positive: u32 = 0; // negative offset (UL below DL)
+        let mag: u32 = 400;
+        let toff: u32 = (sign_positive << 13) | (mag & 0x1FFF); // 14 bits
+        let spac: u32 = 100; // 12.5 kHz
+        let freq: u32 = 159_000_000 / 5;
+
+        let mut v: u128 = 0;
+        v |= (0x34u128) << 88; // opcode at [93:88]
+        v |= (iden as u128) << 76;
+        v |= (bwvu as u128 & 0xF) << 72;
+        v |= (toff as u128 & 0x3FFF) << 58;
+        v |= (spac as u128 & 0x3FF) << 48;
+        v |= (freq as u128 & 0xFFFF_FFFF) << 16;
+
+        let mut block = [0u8; 12];
+        for (i, b) in block.iter_mut().enumerate() {
+            *b = ((v >> (88 - (i * 8))) & 0xFF) as u8;
+        }
+
+        let ft = FreqTable::new();
+        match parse_tsbk(&block, &ft).unwrap() {
+            TsbkEvent::IdentifierUpdate { iden: got_iden, entry } => {
+                assert_eq!(got_iden, 2);
+                assert_eq!(entry.base_hz, 159_000_000);
+                assert_eq!(entry.step_hz, 12_500);
+                assert_eq!(entry.offset_hz, -5_000_000);
             }
             other => panic!("expected IdentifierUpdate, got {other:?}"),
         }
