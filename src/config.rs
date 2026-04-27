@@ -21,7 +21,8 @@ pub struct Cli {
     #[arg(long, value_parser = parse_freq)]
     pub cc_freq: f64,
 
-    /// Comma-separated list of TGIDs whose uplink we should measure
+    /// Comma-separated list of TGIDs whose uplink we should measure. If
+    /// omitted, every grant on the control channel is measured.
     #[arg(long, value_delimiter = ',')]
     pub watch_tgid: Vec<u16>,
 
@@ -87,9 +88,6 @@ pub struct RuntimeConfig {
 
 impl Cli {
     pub fn into_runtime(self) -> Result<RuntimeConfig> {
-        if self.watch_tgid.is_empty() {
-            bail!("--watch-tgid must list at least one TGID");
-        }
         if self.mode == Mode::DualSdr && self.uplink_center.is_none() {
             bail!("--mode dual-sdr requires --uplink-center");
         }

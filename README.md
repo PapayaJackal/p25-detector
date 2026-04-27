@@ -67,7 +67,7 @@ Flags:
 | flag | meaning |
 | --- | --- |
 | `--cc-freq` | Control-channel frequency (Hz; scientific notation OK) |
-| `--watch-tgid` | Comma-separated TGIDs to measure |
+| `--watch-tgid` | Comma-separated TGIDs to measure. Omit to measure every grant. |
 | `--mode` | `single-sdr` (default) or `dual-sdr` |
 | `--cc-device` | RTL-SDR index for the control channel (default `0`) |
 | `--uplink-device` | RTL-SDR index for the uplink (dual-sdr; default `1`) |
